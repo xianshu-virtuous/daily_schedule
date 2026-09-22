@@ -6,7 +6,10 @@
 - 两个模型调用：人设类型判定（按人设指纹缓存）+ 每日日程生成（含让位心声池）；
 - 生成结果落盘成日志，注入时只提供一句「你此刻正在做什么」的旁白，
   不强制场景、不强调、不追加规则；
-- 主人出现时（权限系统判定）把日程时间让出来，措辞取自角色自己的心声池。
+- 主人出现时（权限系统判定）把日程时间让出来，措辞取自角色自己的心声池；
+- 时间一律以 time_sense 为准，它缺席时退回系统时间（见 ``service.current_time``）；
+- 离线生活（默认关闭）：启动时把「它不在线的这段时间」结合当天日程与记忆缝成
+  第一人称日记，按天存进 ``data``，见 :mod:`diary`。
 """
 
 from __future__ import annotations
@@ -86,8 +89,11 @@ class DailySchedulePlugin(BasePlugin):
     """日程系统插件。"""
 
     plugin_name: str = "daily_schedule"
-    plugin_description: str = "让 Bot 拥有自己的日程：预生成一天、回答「你在做什么」、主人来时让出时间"
-    plugin_version: str = "1.0.0"
+    plugin_description: str = (
+        "让 Bot 拥有自己的日程：预生成一天、回答「你在做什么」、主人来时让出时间；"
+        "配合 time_sense 把「不在线的那段时间」记成日记"
+    )
+    plugin_version: str = "1.1.0"
     configs: list[type] = [DailyScheduleConfig]
 
     def __init__(self, config: Any = None) -> None:
@@ -100,6 +106,7 @@ class DailySchedulePlugin(BasePlugin):
         self._schedule_ids: list[str] = []
         self._register_task_id: str | None = None
         self._report_task_id: str | None = None
+        self._settle_task_id: str | None = None
 
     def get_components(self) -> list[type]:
         """返回本插件提供的组件。
@@ -134,6 +141,17 @@ class DailySchedulePlugin(BasePlugin):
             self._report_task_id = task_info.task_id
         except Exception as error:  # noqa: BLE001 - 报告失败只影响日志
             logger.warning(f"[daily_schedule] 排队启动日程报告失败: {error}")
+
+        if isinstance(self.config, DailyScheduleConfig) and self.config.offline.enabled:
+            try:
+                task_info = get_task_manager().create_task(
+                    self._settle_offline_when_ready(),
+                    name="daily_schedule_offline_settlement",
+                    daemon=True,
+                )
+                self._settle_task_id = task_info.task_id
+            except Exception as error:  # noqa: BLE001 - 失败只影响这一篇日记
+                logger.warning(f"[daily_schedule] 排队离线结算失败: {error}")
 
         if isinstance(self.config, DailyScheduleConfig) and not self.config.schedule.prewarm_time.strip():
             logger.info("[daily_schedule] 未配置 prewarm_time，跳过预生成任务注册")
@@ -191,6 +209,13 @@ class DailySchedulePlugin(BasePlugin):
             except Exception:  # noqa: BLE001 - 任务可能已结束
                 pass
             self._report_task_id = None
+
+        if self._settle_task_id:
+            try:
+                get_task_manager().cancel_task(self._settle_task_id)
+            except Exception:  # noqa: BLE001 - 任务可能已结束
+                pass
+            self._settle_task_id = None
 
     async def _startup_report(self) -> None:
         """加载后把当前日程打到日志里。
@@ -295,6 +320,55 @@ class DailySchedulePlugin(BasePlugin):
             await service.prewarm_tick()
         except Exception as error:  # noqa: BLE001 - 巡检失败不打断调度
             logger.error(f"[daily_schedule] 预生成巡检异常: {error}")
+
+    async def _settle_offline_when_ready(self) -> None:
+        """离线生活的启动结算：把「它不在线的时候」记成日记。
+
+        时机放在启动画面收尾之后：结算要读日程、检索记忆、可能调一次模型，
+        这期间往控制台打的日志会被启动进度条盖掉。
+
+        这里不负责等 time_sense——它的启动结算同样在异步跑，先后不确定，
+        真正的等待在 ``service.offline_settlement()`` 里（靠 time_sense 报出的
+        ``boot_at`` 判断本次结算是否已完成）。
+        """
+        from src.app.plugin_system.api import service_api
+
+        await self._wait_boot_ui_done()
+
+        service: Any = None
+        for _ in range(_STARTUP_RETRY_TIMES):
+            try:
+                service = service_api.get_service("daily_schedule:service:schedule")
+            except Exception as error:  # noqa: BLE001 - 拿不到就退避重试
+                logger.debug(f"[daily_schedule] 离线结算取服务失败: {error}")
+                service = None
+
+            if isinstance(service, ScheduleService):
+                break
+            service = None
+            await asyncio.sleep(0.5)
+
+        if not isinstance(service, ScheduleService):
+            logger.warning("[daily_schedule] 等不到日程服务，跳过离线结算")
+            return
+
+        try:
+            result = await service.offline_settlement()
+        except Exception as error:  # noqa: BLE001 - 结算失败不影响启动
+            logger.warning(f"[daily_schedule] 离线结算异常: {error}")
+            return
+
+        if result.get("settled"):
+            entry = result.get("entry") or {}
+            anchors = entry.get("anchors") or []
+            logger.info(
+                f"[daily_schedule] 离线结算已写入"
+                f"（{len(anchors)} 项锚点，来源 {entry.get('source') or '-'}）"
+            )
+        else:
+            logger.info(
+                f"[daily_schedule] 离线结算未写入：{result.get('reason') or '未达条件'}"
+            )
 
 
 __all__ = ["DailySchedulePlugin"]

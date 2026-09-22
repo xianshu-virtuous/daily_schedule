@@ -5,12 +5,37 @@
 
 设计上刻意克制：**不强制场景、不强调、不补充**。日程只是背景，不是剧本。
 
+## 为什么不单独出：这是组合技
+
+一个光会「排今天做什么」的日程插件，最后一定会退化成幻觉：模型不知道这段时间到底过没过、
+自己又做了什么，于是只能在每轮对话里**现编**一句「我刚在看书」——编完就丢，下一轮换个新的，
+前后对不上，主人一问就露馅。
+
+所以这东西要三样合起来才对：
+
+| 锚 | 来自 | 解决什么 |
+| --- | --- | --- |
+| **时间锚** | `time_sense`（同作者，可选依赖） | 这段离线**真的**有多长、从几点到几点 |
+| **框架锚** | 自己的日程表 | 那段时间**本来**安排的是什么 |
+| **记忆锚** | 记忆插件（有则用，没有跳过） | 那段时间前后**真实**聊过什么 |
+
+模型只负责把三者缝成一句话，而缝完的结果会**落盘成日记**（`diary-YYYY-MM-DD.json`），
+下次生成日程时再把它当素材读回来——于是「我昨天做了什么」变成**有据可查的一件事**，
+而不是每轮现编的台词。编出来的东西被记下来、下次以事实的身份参与生成，这一环就是闭环。
+
+没有 `time_sense` 也能跑（`dependencies_required = false`），只是离线生活那部分会安静地不做事。
+
 ## 安装
 
 1. 把 `daily_schedule` 整个文件夹放到主程序的 `plugins/` 下（文件夹名保持 `daily_schedule`，与 `manifest.json` 的 `name` 一致）；
 2. 重启 / 重新加载插件，框架会自动生成配置文件 `config/plugins/daily_schedule/config.toml`；
 3. 打开 `plugin.enabled`（默认已开），按需调整 `[model]`（默认用主回复模型 `actor`）与 `[source]`（人设 / 记忆 / 互联网三层素材）；
 4. 无需额外 Python 依赖（`python_dependencies` 为空）；记忆层与联网层都是「有就用、没有就跳过」，不装也能跑。
+
+想让 Bot 拥有「离线生活」（重启后知道自己不在的时候过了多久、做了什么），再装同作者的
+`time_sense`（声明为 `time_sense>=1.0.0`）并打开 `offline.enabled`。它是**可选依赖**：
+没装也不影响日程本身，只是离线生活那部分安静地不做事（`dependencies_required = false`，
+所以缺了也不会被框架裁掉）。
 
 装好之后可以用 `/日程` 看状态、`/日程 重生成` 立刻生成一份今天的行程。
 
@@ -40,7 +65,11 @@
   那期间往控制台写的日志会被进度画面盖掉（文件日志不受影响，但人眼在控制台看不到）。
   插件以「调度器已启动」（`Bot.start()` 里的事）作为信号，所以表格会落在
   `Bot 初始化成功` / `已触发 ON_START` 之后那一段，跟其它插件的日志排在一起。
-- **轻量注入**：在 chatter 的 user prompt `extra` 板块追加一句「（你此刻正在：……）」，外加一行「这只是背景」的说明
+- **双路注入**：主路把「（你此刻正在：……）」写进 chatter 的 **system reminder**
+  （那套 `<system_reminder>` 标签，模仿 DFC 用 `with_reminder="actor"` 拾取的写法），
+  兜底仍在 user prompt 的 `extra` 里追加一句——两条路内容一致，因为不是所有 chatter 都会拾取 reminder
+- **防背书**：注入文本与模型提示词里都明说「这是背景，不是要你念出来的台词：不要复述原句、
+  不要照搬措辞」。这条来自实测：V4.1 系模型会把注入进来的现成句子**整句搬进回复**
 - **不留强制痕迹**：不产生标题、不要求模型展开、不写「必须拒绝」这类规则；忙碌时给的只是「被搭话也可以说等会儿」的许可
 - **主人到场让位**：权限系统判定为主人后，把日程时间让出来，措辞取自角色自己的心声池
 - **落盘成日志**：生成结果写入 `data/json_storage/daily_schedule/`，既是运行记录，也是下次生成的连续性素材
@@ -74,15 +103,30 @@
 ```
 （你此刻正在：在店里给一台旧收音机换电容，手上正忙，被搭话也可以说等会儿）
 （手上占着，说话可以）
-（这只是你此刻的状态背景。被问到时自然说起就行，不必主动提起，也不必展开描写。）
+（以上只是你此刻的状态背景，不是要你念出来的台词：不要复述这句话本身、不要照搬里面的措辞、
+不要主动提起或展开描写；被问到时用你自己的话说个大概就行。）
 ```
 
 让位期间换成心声：
 
 ```
 （你先说，我这边不急）
-（这只是你此刻的状态背景。……）
+（以上只是你此刻的状态背景，……）
 ```
+
+### 两条注入路径
+
+| 路径 | 写入位置 | 谁拾取 | 开关 |
+| --- | --- | --- | --- |
+| **system reminder（主）** | `prompt_api.add_system_reminder(bucket="actor", name="daily_schedule_scene", …)`，`dynamic` + 同名覆盖写 | DFC / NDFC 建请求时按 `with_reminder="actor"` 自动拾取，并包成 `<system_reminder>…</system_reminder>` | `scene.reminder_enabled` / `reminder_bucket` / `reminder_name` |
+| **extra（兜底）** | `on_prompt_build` 事件里的 `values["extra"]` | 所有 chatter 的 user prompt 模板 | `scene.enabled` + `plugin.target_prompts` |
+
+为什么要绕到 reminder：带 `<system_reminder>` 标签的文本在模型眼里是**系统级元指令**，
+而不是「一段等着被念出来的旁白」——这正是背景不再被背书的关键。`dynamic` + 同名覆盖
+意味着每轮读到的都是**当下这一刻**的场景，不会残留上一段的。
+
+写 reminder 失败只会降级成「这轮退回 extra 注入」，不影响对话。`on_prompt_build` 的参数里
+没有 `stream_id`，所以写的是全局 bucket——日程本来就是 Bot 自己的状态，对所有对话者一致。
 
 注入目标模板由 `plugin.target_prompts` 控制，默认同时兼容 `default_chatter_user_prompt` 与
 `neo_default_chatter_user_prompt`，只有当前实际启用的 chatter 会真正命中。与 prompt_injector、
@@ -94,6 +138,38 @@ booku_memory 等注入器通过换行累加共存，互不覆盖。
 - `scene.yield_scope`：`all`（私聊 + 群聊都算）/ `private`（只认私聊）
 - `scene.yield_idle_minutes`：让位持续的静默时长（默认 30 分钟）；设为 `0` 表示持续到当天结束
 - 让位期间的重复开口不会改措辞、也不会重复记日志
+
+## 离线生活（v1.1.0，默认关闭）
+
+Bot 不在线的那段时间发生了什么，原本**没人知道**：重启之后它只觉得「刚才还在聊」。
+打开离线生活后，每次启动会做这样一件事：
+
+```
+time_sense 结算离线跨度（真的有多久）
+        │
+        ├─ 取日程表里与这段区间相交的条目（那段时间本来安排做什么）
+        ├─ 取记忆插件里的相关事实（有则用）
+        └─ 取前几天的日记（保持延续，别重复写已经写过的事）
+                │
+                ▼
+        模型缝成 1-3 句第一人称的「随手记」
+                │
+                ▼
+        落盘 diary-YYYY-MM-DD.json ──► 回喂进下一次日程生成的素材
+```
+
+几个刻意的设计：
+
+- **默认关闭**（`offline.enabled = false`）：关着的时候，v1.1.0 的行为与 v1.0.0 完全一致，
+  一次额外的模型调用都不会发生
+- **它写的是记录，不是台词**：提示词明确要求「材料里没有的一律不写，宁可写得平淡」，
+  并写明这段文字是给角色**当背景**的，不是让它照本宣科念出来
+- **同一天只有一份日记**：一天里多次离线会合并进同一份，每个离线段落是一条 entry
+- **三种情况不写**：开关没开、没有基线（首装）、短于 `offline.min_seconds`（默认 1800 秒）——
+  几分钟的重启不值得写成故事
+- **依赖是可选的**：`time_sense` 不在时 `wait_time_sense_settled()` 直接返回，安静跳过。
+  两个插件的启动结算都是异步任务，所以日程这边会等 `time_sense` 的 `boot_at` 追上本进程
+  启动时刻再动手，免得读到上一轮的旧跨度
 
 ## 命令
 
@@ -108,6 +184,7 @@ booku_memory 等注入器通过换行累加共存，互不覆盖。
 /日程 让位   /yield      手动让位（验证文案用）
 /日程 收回   /unyield    结束让位
 /日程 日志   /log        最近几天的生成记录
+/日程 日记   /diary      最近三天的离线日记（含锚点，看它到底以为什么发生过）
 /日程 帮助   /help       帮助
 ```
 
@@ -122,7 +199,13 @@ booku_memory 等注入器通过换行累加共存，互不覆盖。
 | `[source]` | `use_persona` / `use_memory` / `use_internet` / `search_query` | 三层素材开关与检索词模板 |
 | `[schedule]` | `prewarm_time` / `check_interval_seconds` / `generate_on_demand` / `refresh_if_older_hours` / `min_entries` / `max_entries` | 预生成时刻、巡检间隔（秒，最小 30）、按需补生成、过期刷新与条目区间 |
 | `[scene]` | `enabled` / `template` / `busy_suffix` / `busy_min_level` / `hint_template` / `note` / `fallback` | 注入文本模板与忙碌许可阈值 |
+| `[scene]` | `reminder_enabled` / `reminder_bucket` / `reminder_name` | 是否走 system reminder 主路、bucket 名（默认 `actor`）、reminder 名（同名覆盖写） |
 | `[scene]` | `yield_enabled` / `yield_min_level` / `yield_scope` / `yield_idle_minutes` / `yield_template` | 让位开关、权限门槛、范围、时长与模板 |
+| `[offline]` | `enabled` / `min_seconds` / `generate_text` | 离线生活总开关、起写门槛（秒）、是否调模型缝文本（关掉则只记时间事实） |
+| `[offline]` | `use_schedule_context` / `max_schedule_lines` | 是否拿日程表当锚点、最多取几行 |
+| `[offline]` | `use_memory` / `memory_top_k` / `memory_query` | 记忆锚开关、条数、检索词（留空用默认模板） |
+| `[offline]` | `history_days` / `keep_days` | 回喂几天日记、日记保留天数（更早的自动清理） |
+| `[offline]` | `inject_enabled` / `inject_days` | 是否把最近日记注入对话、注入最近几天 |
 | `[log]` | `enabled` | 是否写生成日志 |
 
 全部关闭注入的方式：把 `plugin.enabled` 设为 `false`（插件不注册任何组件，等同整体下线），
@@ -136,6 +219,10 @@ booku_memory 等注入器通过换行累加共存，互不覆盖。
 - `log-YYYY-MM-DD.json`：某天的日志（生成记录 + 事件流，如让位）
 - `persona-profile.json`：人设类型判定缓存（带人设指纹）
 - `runtime-state.json`：让位与生成节流状态、最近一次失败原因
+- `diary-YYYY-MM-DD.json`：离线生活日记（每个离线段落一条 entry，连带缝合时用到的锚点一起留档）
+
+三个键族的分工别混：`schedule-` 是**计划**，`log-` 是**生成记录**，`diary-` 是**真的发生过什么**。
+日记里连锚点一起存，是为了事后能核对「它这句到底是缝出来的，还是编出来的」。
 
 ## 测试
 
@@ -147,6 +234,11 @@ python -m pytest test/plugins/daily_schedule -q
 模型返回清洗、人设判定缓存与降级、权限门控让位、日志表格对齐（中文宽度 / 截断 / Rich 标记转义），
 以及两个事件处理器的失败降级路径。
 样例人设使用中性的原创 OC 与虚构作品角色，不绑定任何具体作品。
+
+v1.1.0 起另外覆盖：离线跨度与日程条目的相交取样、日记数据层（排序 / 条数上限 / 合并 / 脏数据）、
+时间源在 `time_sense` 有和无两种情形下的取值与 `touch` 调用、启动落定等待（旧 `boot_at` 超时、
+新 `boot_at` 通过、服务缺失返回假）、离线结算的四种分支（关闭 / 无基线 / 低于门槛 / 正常写），
+以及 system reminder 的写读往返与「关掉 reminder 后仍走 extra」。
 
 ## 出问题时先看这几行日志
 

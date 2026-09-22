@@ -195,6 +195,27 @@ class DailyScheduleConfig(BaseConfig):
             default=True,
             description="是否向对话注入「此刻在做什么」的场景提示。",
         )
+        reminder_enabled: bool = Field(
+            default=True,
+            description=(
+                "是否额外把这句背景写进 system reminder 的 bucket。\n"
+                "DFC / NDFC 会用 with_reminder=\"actor\" 建请求，自动拾取全局与流私有\n"
+                "bucket 并包成 <system_reminder> 标签——模型会把它当系统级元指令，\n"
+                "而不是一段等着被念出来的旁白（这是背景设定不被背书的关键）。\n"
+                "关闭后只走 user prompt 的 extra 注入。"
+            ),
+        )
+        reminder_bucket: str = Field(
+            default="actor",
+            description=(
+                "写入的 reminder bucket 名，需与 chatter 的 with_reminder 一致。\n"
+                "DFC 主会话用 actor，决策子代理用 sub_actor。"
+            ),
+        )
+        reminder_name: str = Field(
+            default="daily_schedule_scene",
+            description="reminder 名称：同名即覆盖写，因此每轮读到的都是当下的场景。",
+        )
         template: str = Field(
             default="（你此刻正在：{doing}）",
             description=(
@@ -219,11 +240,13 @@ class DailyScheduleConfig(BaseConfig):
         )
         note: str = Field(
             default=(
-                "（这只是你此刻的状态背景。被问到时自然说起就行，"
-                "不必主动提起，也不必展开描写。）"
+                "（以上只是你此刻的状态背景，不是要你念出来的台词："
+                "不要复述这句话本身、不要照搬里面的措辞、"
+                "不要主动提起或展开描写；被问到时用你自己的话说个大概就行。）"
             ),
             description=(
-                "场景行下方的说明，用来约束主模型不要把场景当成必须执行的剧本。\n"
+                "场景行下方的说明，用来约束主模型把背景当背景——"
+                "既不要当成必须执行的剧本，也不要**背书**（照搬到回复里）。\n"
                 "留空表示不加说明。"
             ),
         )
@@ -280,12 +303,92 @@ class DailyScheduleConfig(BaseConfig):
             ),
         )
 
+    @config_section("offline")
+    class OfflineSection(SectionBase):
+        """离线生活配置（默认关闭）。
+
+        开启后，Bot 每次启动都会拿 time_sense 结算出的离线跨度，
+        结合当天日程与记忆服务里的真事，缝出一段「我那时在做什么」，
+        按天合并成日记存到 ``data/json_storage/daily_schedule/diary-*.json``。
+
+        设计上默认关闭：不开启时行为与 v1.0.0 完全一致，不会多花一次模型调用。
+        """
+
+        enabled: bool = Field(
+            default=False,
+            description=(
+                "是否开启离线生活（把「它不在线的那段时间」记成日记）。\n"
+                "关闭时本插件行为与之前完全一致，不产生额外模型调用。\n"
+                "开启前请确认已安装并启用 time_sense，它是本功能的依赖。"
+            ),
+        )
+        min_seconds: int = Field(
+            default=1800,
+            description=(
+                "离线时长达到多少秒才值得记一笔。\n"
+                "默认 1800（半小时）：重启几秒钟不该写成「我睡了一觉」。"
+            ),
+        )
+        generate_text: bool = Field(
+            default=True,
+            description=(
+                "是否调用模型把材料缝成第一人称的正文。\n"
+                "关闭后只记录「哪段时间不在线」这个事实，不花模型调用。"
+            ),
+        )
+        use_schedule_context: bool = Field(
+            default=True,
+            description="是否把离开期间原本排的日程段作为材料（让生活节奏连贯）。",
+        )
+        max_schedule_lines: int = Field(
+            default=6,
+            description="最多引用几段日程。跨天离线时会取「离开那天」与「回来那天」各一部分。",
+        )
+        use_memory: bool = Field(
+            default=True,
+            description="是否检索记忆服务里的真事作为材料（允许日记提到主人与过去的事）。",
+        )
+        memory_top_k: int = Field(
+            default=5,
+            description="记忆检索最多取几条。",
+        )
+        memory_query: str = Field(
+            default="",
+            description=(
+                "记忆检索关键词，可留空使用默认值。\n"
+                "可用占位符：{day} 日期、{period} 时刻、{doing} 当时原本在做的事。"
+            ),
+        )
+        history_days: int = Field(
+            default=2,
+            description=(
+                "回喂前几天的日记作为延续材料。\n"
+                "这是「延续」的关键：写下来的过去会成为下一次生成的输入。"
+            ),
+        )
+        keep_days: int = Field(
+            default=30,
+            description="日记保留天数，超出即回收；设为 0 表示永久保留。",
+        )
+        inject_enabled: bool = Field(
+            default=False,
+            description=(
+                "是否把最近的日记注入对话提示词。\n"
+                "开启后主模型才知道「它不在的时候做了什么」，被问起时不会前后矛盾。"
+            ),
+        )
+        inject_days: int = Field(
+            default=1,
+            description="注入最近几天的日记（1 表示只给最近一篇）。",
+        )
+
     plugin: PluginSection = Field(default_factory=PluginSection)
     model: ModelSection = Field(default_factory=ModelSection)
     source: SourceSection = Field(default_factory=SourceSection)
     schedule: ScheduleSection = Field(default_factory=ScheduleSection)
     scene: SceneSection = Field(default_factory=SceneSection)
     log: LogSection = Field(default_factory=LogSection)
+    offline: OfflineSection = Field(default_factory=OfflineSection)
 
 
 __all__ = ["DailyScheduleConfig"]

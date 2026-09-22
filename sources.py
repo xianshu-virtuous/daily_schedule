@@ -16,7 +16,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from src.app.plugin_system.api import service_api, tool_api
+from src.app.plugin_system.api import service_api
 from src.app.plugin_system.api.log_api import get_logger
 
 from .config import DailyScheduleConfig
@@ -28,6 +28,40 @@ _MCP_PREFIX = "mcp_provider:tool:"
 
 #: 自动探测搜索工具时的关键词（按优先级）。
 _SEARCH_KEYWORDS = ("search", "ddg", "duckduckgo", "web", "fetch")
+
+
+def _tool_registry() -> Any | None:
+    """取组件注册表。
+
+    框架没有插件侧的 ``tool_api``：工具能力的真身在
+    :mod:`src.core.components.registry`（枚举签名 / 取组件类）。这里惰性导入，
+    框架内部路径变化时只让互联网层降级，而不是整个插件加载失败。
+
+    Returns:
+        全局注册表；不可用时返回 ``None``。
+    """
+    try:
+        from src.core.components.registry import get_global_registry
+
+        return get_global_registry()
+    except Exception as error:  # noqa: BLE001 - 拿不到就当作没有工具
+        logger.debug(f"[daily_schedule] 组件注册表不可用: {error}")
+        return None
+
+
+def _tool_use() -> Any | None:
+    """取工具执行器（惰性导入）。
+
+    Returns:
+        ``ToolUse`` 单例；不可用时返回 ``None``。
+    """
+    try:
+        from src.core.managers.tool_manager import get_tool_use
+
+        return get_tool_use()
+    except Exception as error:  # noqa: BLE001 - 拿不到就当作不能调用
+        logger.debug(f"[daily_schedule] 工具执行器不可用: {error}")
+        return None
 
 
 @dataclass
@@ -191,25 +225,29 @@ def discover_search_tool(config: DailyScheduleConfig) -> str | None:
     Returns:
         工具签名；没有可用工具时返回 ``None``。
     """
+    registry = _tool_registry()
+    if registry is None:
+        return None
+
     try:
-        tools = tool_api.get_all_tools()
-    except Exception as error:  # noqa: BLE001 - 工具枚举失败按不可用处理
+        signatures = registry.list_all()
+    except Exception as error:  # noqa: BLE001 - 枚举失败按不可用处理
         logger.warning(f"[daily_schedule] 枚举工具失败: {error}")
         return None
 
-    if not isinstance(tools, dict):
+    if not isinstance(signatures, (list, tuple)) or not signatures:
         return None
 
     configured = config.source.search_tool_signature.strip()
     if configured:
-        if configured in tools:
+        if configured in signatures:
             return configured
         logger.warning(
             f"[daily_schedule] 配置的搜索工具 {configured} 未注册，回退到自动探测"
         )
 
     candidates: list[tuple[int, str]] = []
-    for signature in tools:
+    for signature in signatures:
         if not signature.startswith(_MCP_PREFIX):
             continue
         lowered = signature.lower()
@@ -239,8 +277,13 @@ def _search_params(signature: str, query: str) -> dict[str, Any]:
     Returns:
         传给工具的参数字典。
     """
+    registry = _tool_registry()
+    if registry is None:
+        return {"query": query}
+
     try:
-        schema = tool_api.get_tool_schema(signature)
+        tool_cls = registry.get(signature)
+        schema = tool_cls.to_schema() if tool_cls is not None else None
     except Exception as error:  # noqa: BLE001 - schema 获取失败时退回默认参数名
         logger.warning(f"[daily_schedule] 获取 {signature} schema 失败: {error}")
         return {"query": query}
@@ -248,10 +291,13 @@ def _search_params(signature: str, query: str) -> dict[str, Any]:
     if not isinstance(schema, dict):
         return {"query": query}
 
-    # schema 可能是 {"function": {...}} 或直接是参数字典
+    # BaseTool.to_schema() 给的是 {"name", "description", "parameters"}
+    # （parameters 才是 JSON Schema）；这里同时兼容 {"function": {...}} 的写法。
     node = schema.get("function") if isinstance(schema.get("function"), dict) else schema
-    properties = node.get("properties") if isinstance(node, dict) else None
-    required = node.get("required") if isinstance(node, dict) else None
+    parameters = node.get("parameters") if isinstance(node, dict) else None
+    container = parameters if isinstance(parameters, dict) else node
+    properties = container.get("properties") if isinstance(container, dict) else None
+    required = container.get("required") if isinstance(container, dict) else None
 
     if not isinstance(properties, dict) or not properties:
         return {"query": query}
@@ -322,8 +368,12 @@ async def collect_internet_notes(
     message = _synthetic_message(query)
     params = _search_params(signature, query)
 
+    tool_use = _tool_use()
+    if tool_use is None:
+        return []
+
     try:
-        success, result = await tool_api.execute_tool(
+        success, result = await tool_use.execute_tool(
             signature, plugin, message, **params
         )
     except Exception as error:  # noqa: BLE001 - 工具异常按无素材处理

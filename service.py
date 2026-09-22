@@ -10,6 +10,16 @@
 生成一律走后台任务（``task_manager``）：注入发生在 prompt 构建链路里，
 绝不能在那一轮等待模型生成，否则会拖慢回复。当轮先不注入，下一轮生效。
 
+时间只认 time_sense：本插件所有「现在几点」都走
+:meth:`ScheduleService.current_time`，它读 time_sense 的时间事实。
+日程侧与时间侧各自 ``datetime.now()`` 迟早会错开（跨天判定、注入的当前时段
+都会跟着歪），所以这里不留第二套时钟；time_sense 缺席时退回系统时间，
+功能不中断。
+
+离线生活（``offline.enabled``，默认关闭）：启动时拿 time_sense 结算出的
+离线跨度，结合当天日程与记忆服务缝成第一人称的日记，按天合并存盘，
+见 :mod:`diary`。
+
 注意：框架的 ``service_api.get_service()`` 每次调用都会 **新建** 一个服务实例
 （非单例）。所以跨调用者共享的东西只能放两处——要么落在类属性上（进程内共享），
 要么落盘到 ``store``（跨进程、跨重启共享）。日程、日志、让位状态都在盘上；
@@ -18,16 +28,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime, timedelta
 from typing import Any
 
+from src.app.plugin_system.api import service_api
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BaseService
 from src.app.plugin_system.types import PermissionLevel
 from src.kernel.concurrency import get_task_manager
 
-from . import generator, scene, store
+from . import diary, generator, scene, store
 from .config import DailyScheduleConfig
 from .models import BUSY_LABELS, DailySchedule, RuntimeState
 from .persona import read_persona
@@ -45,6 +57,18 @@ _PREWARM_TICK_SECONDS = 1800
 #: 「正在生成」标记的有效期（秒）。超过这个时长仍为生成中，视作上一次任务
 #: 异常中断留下的残标，允许重新抢占，避免生成能力被永久锁死。
 _GENERATION_STALE_SECONDS = 900
+
+#: time_sense 服务签名。日程的时间一律以它为准——它是本进程里「真实时间」的
+#: 唯一权威，还负责在启动时结算离线跨度。两处各算一次时间，迟早会对不上。
+_TIME_SENSE_SIGNATURE = "time_sense:service:time_sense"
+
+#: 本进程的时间基准（本模块被导入的时刻）。用来判断 time_sense 报出的
+#: ``boot_at`` 是不是「本次进程启动之后」的，见 ``wait_time_sense_settled``。
+_PROCESS_START_TS = time.time()
+
+#: 等 time_sense 完成本次启动结算的最长秒数。超时后按当前值结算，
+#: 由 diary 的按时刻去重兜住重复。
+_OFFLINE_BOOT_WAIT_SECONDS = 120.0
 
 #: 日志表格各列的最大显示宽度（时段 / 忙 / 在做什么）。
 #: 总宽约 91 列，宽一点的终端里不会折行，窄终端里也只折一次。
@@ -116,6 +140,215 @@ class ScheduleService(BaseService):
             ``YYYY-MM-DD``。
         """
         return (now or datetime.now()).date().isoformat()
+
+    # ── 时间源（time_sense） ─────────────────────────────────────────────────
+
+    def _sense(self) -> Any | None:
+        """取 time_sense 服务。
+
+        Returns:
+            服务实例；未安装、未启用或查询失败时返回 ``None``。
+        """
+        try:
+            service = service_api.get_service(_TIME_SENSE_SIGNATURE)
+        except Exception as error:  # noqa: BLE001 - 服务查询失败按不可用处理
+            logger.debug(f"[daily_schedule] 查询 time_sense 失败: {error}")
+            return None
+        return service if service is not None else None
+
+    async def current_time(
+        self, *, touch: bool = False, reason: str = ""
+    ) -> datetime:
+        """取当前时间，优先以 time_sense 为准。
+
+        这是本插件唯一的时间入口。time_sense 是时间事实的权威，日程侧不再
+        自己 ``datetime.now()``——两套时钟在跨天那一刻必然分岔。
+
+        形态是异步的：调用点全在 ``async`` 方法里，而 ``touch`` 需要 await，
+        同步签名会逼每个调用方自己拆成两段。
+
+        Args:
+            touch: 是否顺手建立一次「当前时间戳」。用户主动询问日程时用，
+                这样 time_sense 记下的时刻与这次询问严格对应。
+            reason: 建立时间戳的原因（写进 time_sense 的状态文件，便于排查）。
+
+        Returns:
+            当前时间；拿不到 time_sense 时退回系统时间。
+        """
+        service = self._sense()
+        if service is None:
+            return datetime.now()
+
+        if touch:
+            touch_method = getattr(service, "touch", None)
+            if callable(touch_method):
+                try:
+                    await touch_method(reason=reason or "询问日程", force=True)
+                except Exception as error:  # noqa: BLE001 - 打点失败不影响读时间
+                    logger.debug(f"[daily_schedule] 建立时间戳失败: {error}")
+
+        snapshot_method = getattr(service, "now_snapshot", None)
+        if not callable(snapshot_method):
+            return datetime.now()
+
+        try:
+            snapshot = snapshot_method()
+        except Exception as error:  # noqa: BLE001 - 读时间失败退回系统时间
+            logger.debug(f"[daily_schedule] 读取 time_sense 时间失败: {error}")
+            return datetime.now()
+
+        raw = snapshot.get("timestamp") if isinstance(snapshot, dict) else getattr(
+            snapshot, "timestamp", None
+        )
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return datetime.now()
+        if value <= 0:
+            return datetime.now()
+        return datetime.fromtimestamp(value)
+
+    async def wait_time_sense_settled(self, timeout: float | None = None) -> bool:
+        """等 time_sense 完成本次启动的离线结算。
+
+        time_sense 的启动结算与本次结算都是异步任务，谁先谁后不确定。若在它
+        结算前读 ``offline_span()``，读到的是**上一轮**启动的时间事实——那段
+        离线会被重复记一笔，或者记成一段早就发生过的跨度。
+
+        同进程内可以直接判断：time_sense 结算后会把自己的启动时刻写进
+        ``boot_at``，而早于本进程启动的 ``boot_at`` 必定来自上一轮。
+
+        Args:
+            timeout: 最长等待秒数，默认 ``_OFFLINE_BOOT_WAIT_SECONDS``。
+
+        Returns:
+            本次启动的结算已完成返回 True；服务不可用或超时返回 False。
+        """
+        service = self._sense()
+        if service is None:
+            return False
+
+        span_method = getattr(service, "offline_span", None)
+        if not callable(span_method):
+            return False
+
+        budget = _OFFLINE_BOOT_WAIT_SECONDS if timeout is None else max(0.0, timeout)
+        deadline = time.time() + budget
+
+        while True:
+            try:
+                span = await span_method()
+            except Exception as error:  # noqa: BLE001 - 读失败退避重试
+                logger.debug(f"[daily_schedule] 等 time_sense 结算时读取失败: {error}")
+                span = None
+
+            if isinstance(span, dict):
+                try:
+                    boot_ts = float(span.get("boot_at") or 0.0)
+                except (TypeError, ValueError):
+                    boot_ts = 0.0
+                if boot_ts >= _PROCESS_START_TS:
+                    return True
+
+            if time.time() >= deadline:
+                return False
+            await asyncio.sleep(0.5)
+
+    async def offline_settlement(self) -> dict[str, Any]:
+        """启动结算：把「它不在线的这段时间」记成日记。
+
+        由插件在启动流程里作为后台任务调用。这里只做编排——读跨度、
+        交给 :mod:`diary` 决定记不记、记成什么——判断逻辑都在 diary 里。
+
+        Returns:
+            结算摘要（日志与排查用）：``settled`` 是否写入，
+            ``reason`` 未写入的原因，``span`` 时间锚，``entry`` 写入的条目。
+        """
+        config = self.config
+        result: dict[str, Any] = {"settled": False, "reason": ""}
+
+        if not getattr(config.offline, "enabled", False):
+            result["reason"] = "offline.enabled 未开启"
+            return result
+
+        service = self._sense()
+        if service is None:
+            result["reason"] = "time_sense 不可用"
+            logger.warning(
+                "[daily_schedule] 离线生活已开启，但 time_sense 不可用，跳过本次结算"
+            )
+            return result
+
+        # 先等它把本次启动的离线跨度结算出来，否则读到的是上一轮的时间事实
+        if not await self.wait_time_sense_settled():
+            logger.warning(
+                f"[daily_schedule] 等 time_sense 启动结算超时"
+                f"（{_OFFLINE_BOOT_WAIT_SECONDS:.0f}s），按当前值结算"
+            )
+
+        span_method = getattr(service, "offline_span", None)
+        if not callable(span_method):
+            result["reason"] = "time_sense 缺少 offline_span"
+            logger.warning(
+                "[daily_schedule] time_sense 版本不匹配（无 offline_span），跳过离线结算"
+            )
+            return result
+
+        try:
+            span = await span_method()
+        except Exception as error:  # noqa: BLE001 - 结算失败不该影响启动
+            result["reason"] = f"读取离线跨度失败: {error}"
+            logger.warning(f"[daily_schedule] 读取离线跨度失败: {error}")
+            return result
+
+        result["span"] = span
+
+        try:
+            entry = await diary.record_offline(config, span)
+        except Exception as error:  # noqa: BLE001 - 日记失败不该影响启动
+            result["reason"] = f"记录日记失败: {error}"
+            logger.warning(f"[daily_schedule] 记录离线日记失败: {error}")
+            return result
+
+        if entry is None:
+            result["reason"] = "未达记录条件"
+            return result
+
+        result["settled"] = True
+        result["entry"] = entry.to_dict()
+        return result
+
+    async def diary_days(self, limit: int = 3) -> list[Any]:
+        """取最近几天的日记（命令展示用）。
+
+        Args:
+            limit: 天数上限。
+
+        Returns:
+            日记列表（倒序）；没有记录时返回空列表。
+        """
+        return await diary.recent_days(limit)
+
+    async def diary_injection(self) -> str:
+        """取要注入对话的日记文本。
+
+        只有 ``offline.enabled`` 与 ``offline.inject_enabled`` 同时开启时才有内容：
+        主模型得先知道「它不在的时候做了什么」，被问起时才不会前后矛盾。
+
+        Returns:
+            注入文本；不需要注入时返回空字符串。
+        """
+        config = self.config
+        if not getattr(config.offline, "enabled", False):
+            return ""
+        if not getattr(config.offline, "inject_enabled", False):
+            return ""
+
+        days = await diary.recent_days(max(1, int(config.offline.inject_days)))
+        blocks = [day.text_block() for day in days if not day.is_empty]
+        if not blocks:
+            return ""
+        return "【它不在线的时候（真实发生过的，可自然提起）】\n" + "\n\n".join(blocks)
 
     async def get_schedule(
         self, day: str | None = None, *, now: datetime | None = None
@@ -297,7 +530,7 @@ class ScheduleService(BaseService):
         Returns:
             打印过的行；当天没有日程时返回空列表。
         """
-        moment = now or datetime.now()
+        moment = now or await self.current_time()
         schedule = await self.get_schedule(now=moment)
         if schedule is None or schedule.is_empty or schedule.date != moment.date().isoformat():
             return []
@@ -327,7 +560,7 @@ class ScheduleService(BaseService):
         if not config.plugin.enabled:
             return ""
 
-        moment = now or datetime.now()
+        moment = now or await self.current_time()
         day = moment.date().isoformat()
         schedule = await self.get_schedule(now=moment)
         if schedule is not None and schedule.date != day:
@@ -370,7 +603,7 @@ class ScheduleService(BaseService):
             生成或已存在的日程；失败返回 ``None``。已有生成在跑时，
             直接返回现有日程（不排队、不等待）。
         """
-        moment = now or datetime.now()
+        moment = now or await self.current_time()
         day = moment.date().isoformat()
 
         if not force:
@@ -400,8 +633,9 @@ class ScheduleService(BaseService):
             return False
 
         async def _job() -> None:
+            moment = await self.current_time()
             try:
-                await self._generate(datetime.now())
+                await self._generate(moment)
             finally:
                 self._release_generation()
 
@@ -427,7 +661,7 @@ class ScheduleService(BaseService):
         Returns:
             新生成的日程；失败返回 ``None``。
         """
-        moment = now or datetime.now()
+        moment = now or await self.current_time()
         if day and day != moment.date().isoformat():
             # 只支持重生成今天：日程的「此刻状态」语义只对当天成立
             logger.warning("[daily_schedule] 仅支持重新生成当天日程")
@@ -443,7 +677,7 @@ class ScheduleService(BaseService):
         if not config.plugin.enabled:
             return
 
-        moment = datetime.now()
+        moment = await self.current_time()
         day = moment.date().isoformat()
 
         prewarm = config.schedule.prewarm_time.strip()
@@ -494,7 +728,7 @@ class ScheduleService(BaseService):
         if not config.plugin.enabled or not config.scene.enabled:
             return ""
 
-        moment = now or datetime.now()
+        moment = now or await self.current_time()
         schedule = await store.load_schedule(moment.date().isoformat())
         state = await store.load_state()
 
@@ -508,6 +742,13 @@ class ScheduleService(BaseService):
                 logger.info("[daily_schedule] 当天日程缺失或过期，已排队后台生成")
 
         injection = scene.build_injection(config, schedule, state, moment)
+
+        # 日记接在场景行之后：场景说明「此刻」，日记补上「它不在的时候」，
+        # 两者都是真实材料，主模型被问起时才接得上话。
+        diary_block = await self.diary_injection()
+        if diary_block:
+            injection = f"{injection}\n{diary_block}" if injection else diary_block
+
         if config.plugin.debug_log:
             logger.debug(f"[daily_schedule] 注入内容：\n{injection}")
         return injection
@@ -553,7 +794,7 @@ class ScheduleService(BaseService):
             if "private" not in chat_type_text:
                 return False
 
-        moment = now or datetime.now()
+        moment = now or await self.current_time()
         state = await store.load_state()
 
         idle_minutes = max(0, int(config.scene.yield_idle_minutes))
@@ -600,7 +841,9 @@ class ScheduleService(BaseService):
         Returns:
             状态字典。
         """
-        moment = now or datetime.now()
+        # 用户主动询问日程：顺手在 time_sense 立一个时间戳，让「它何时被问起」
+        # 与「它回答时以为的现在」严格是同一刻，也顺带确认它读到的确实是这个时刻。
+        moment = now or await self.current_time(touch=True, reason="查看日程")
         day = moment.date().isoformat()
         schedule = await store.load_schedule(day)
         state = await store.load_state()
@@ -632,6 +875,8 @@ class ScheduleService(BaseService):
             "yield_until": state.yield_until,
             "generating": self.is_generating(),
             "last_error": state.last_error,
+            "offline_enabled": bool(getattr(self.config.offline, "enabled", False)),
+            "diary_dates": await store.recent_diary_dates(7),
         }
 
     async def recent_days(self, limit: int = 3) -> list[str]:
@@ -645,6 +890,28 @@ class ScheduleService(BaseService):
         """
         return await store.recent_log_dates(limit)
 
+    def _quick_now(self) -> datetime:
+        """同步取当前时间：优先 time_sense 的快照，取不到就用系统时间。
+
+        ``current_time`` 是异步接口（要求 touch 时得落盘），但个别调用点本身
+        是**同步**方法（如 ``next_day_switch``），不能 await。这里退而求其次：
+        只读一次快照，不做任何写盘。快照本身是同步方法，所以安全。
+
+        Returns:
+            当前时间。
+        """
+        sense = self._sense()
+        snapshot_method = getattr(sense, "now_snapshot", None)
+        if callable(snapshot_method):
+            try:
+                snapshot = snapshot_method()
+                stamp = float(snapshot["timestamp"])
+                if stamp > 0:
+                    return datetime.fromtimestamp(stamp)
+            except Exception:  # noqa: BLE001 - 快照不可用则回落系统时间
+                pass
+        return datetime.now()
+
     def next_day_switch(self, now: datetime | None = None) -> datetime:
         """取次日零点时间（命令展示跨天倒计时用）。
 
@@ -654,7 +921,7 @@ class ScheduleService(BaseService):
         Returns:
             次日零点。
         """
-        moment = now or datetime.now()
+        moment = now or self._quick_now()
         return datetime.combine(
             moment.date() + timedelta(days=1), datetime.min.time()
         )

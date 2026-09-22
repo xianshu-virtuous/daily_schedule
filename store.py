@@ -45,6 +45,9 @@ LOG_PREFIX = "log-"
 #: 日程键前缀。
 SCHEDULE_PREFIX = "schedule-"
 
+#: day 日记键前缀。
+DIARY_PREFIX = "diary-"
+
 
 def schedule_key(date_str: str) -> str:
     """生成某天日程的存储键。
@@ -249,18 +252,122 @@ async def save_state(state: RuntimeState) -> bool:
     return await _save_raw(STATE_KEY, state.to_dict())
 
 
+# ── day 日记（离线生活） ─────────────────────────────────────────────────────
+#
+# 日记刻意用独立的键，不和 schedule- / log- 混在一起：日程是「计划」，
+# 日志是「生成记录」，日记是「已经发生过的事实」。三者语义不同，
+# 混在一个键里迟早会把「计划」当成「发生过的」回喂给模型——那正是幻觉的来源。
+#
+# 这里只做 dict 的存取，不认识 DiaryDay 模型，避免 store 与 diary 互相导入。
+
+
+def diary_key(date_str: str) -> str:
+    """生成某天日记的存储键。
+
+    Args:
+        date_str: ``YYYY-MM-DD``。
+
+    Returns:
+        存储键名。
+    """
+    return f"{DIARY_PREFIX}{date_str}"
+
+
+async def load_diary(date_str: str) -> dict[str, Any] | None:
+    """读取某天的日记。
+
+    Args:
+        date_str: ``YYYY-MM-DD``。
+
+    Returns:
+        日记字典，或 ``None``。
+    """
+    return await _load_raw(diary_key(date_str))
+
+
+async def save_diary(date_str: str, payload: dict[str, Any]) -> bool:
+    """保存某天的日记。
+
+    Args:
+        date_str: ``YYYY-MM-DD``。
+        payload: 日记内容。
+
+    Returns:
+        是否保存成功。
+    """
+    return await _save_raw(diary_key(date_str), payload)
+
+
+async def recent_diary_dates(limit: int) -> list[str]:
+    """列出最近有日记的日期。
+
+    Args:
+        limit: 返回条数上限（按日期倒序）。
+
+    Returns:
+        日期字符串列表（``YYYY-MM-DD``，倒序）。
+    """
+    try:
+        names = await storage_api.list_json(STORE_NAME)
+    except Exception as error:  # noqa: BLE001 - 存储异常不应影响对话主流程
+        logger.warning(f"[daily_schedule] 列出存储键失败: {error}")
+        return []
+
+    dates = sorted(
+        (name[len(DIARY_PREFIX) :] for name in names if name.startswith(DIARY_PREFIX)),
+        reverse=True,
+    )
+    return dates[: max(0, limit)]
+
+
+async def prune_diaries(keep_days: int) -> list[str]:
+    """删掉超出保留期的日记。
+
+    只删 diary- 键，绝不碰 schedule- / log-：那两份是生成素材，
+    删了会让日程失去连续性，而日记的定位是「可读的过去」，过期即可回收。
+
+    Args:
+        keep_days: 保留最近多少天；小于等于 0 表示永久保留，不删。
+
+    Returns:
+        被删除的日期列表（倒序）。
+    """
+    if keep_days <= 0:
+        return []
+
+    dates = await recent_diary_dates(10_000)
+    doomed = dates[max(0, keep_days) :]
+    if not doomed:
+        return []
+
+    removed: list[str] = []
+    for date_str in doomed:
+        try:
+            await storage_api.delete_json(STORE_NAME, diary_key(date_str))
+            removed.append(date_str)
+        except Exception as error:  # noqa: BLE001 - 删不掉只是占点空间
+            logger.warning(f"[daily_schedule] 删除旧日记 {date_str} 失败: {error}")
+    return removed
+
+
 __all__ = [
+    "DIARY_PREFIX",
     "LOG_PREFIX",
     "PERSONA_KEY",
     "SCHEDULE_PREFIX",
     "STATE_KEY",
     "STORE_NAME",
+    "diary_key",
+    "load_diary",
     "load_log",
     "load_persona_profile",
     "load_schedule",
     "load_state",
     "log_key",
+    "prune_diaries",
+    "recent_diary_dates",
     "recent_log_dates",
+    "save_diary",
     "save_log",
     "save_persona_profile",
     "save_schedule",

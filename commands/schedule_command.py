@@ -10,6 +10,7 @@
     /日程 让位   /yield       — 手动让位（主人到场验证用）
     /日程 收回   /unyield     — 结束让位，恢复日程
     /日程 日志   /log         — 最近几天的生成记录
+    /日程 日记   /diary       — 离线生活的日记（它不在线的时候在做什么）
     /日程 帮助   /help        — 帮助
 
 命令级权限为 OWNER：这是主人的插件。
@@ -43,6 +44,7 @@ _USAGE = """\
   让位 / yield         — 手动让位（验证用）
   收回 / unyield       — 结束让位
   日志 / log           — 最近生成记录
+  日记 / diary         — 离线时在做什么（离线生活）
   帮助 / help          — 本帮助"""
 
 
@@ -186,7 +188,10 @@ class ScheduleCommand(BaseCommand):
             await self._reply("今天还没有日程，可用 /日程 重生成 生成一份。")
             return True, "empty"
 
-        now = datetime.now().strftime("%H:%M")
+        # 时间以 time_sense 为准（并顺手在那里立一个时间戳）：
+        # 命令显示的「现在」必须和日程系统判定的「现在」是同一刻。
+        moment = await service.current_time(touch=True, reason="查看日程")
+        now = moment.strftime("%H:%M")
         lines = [f"【{schedule.date} 日程】"]
         for entry in schedule.entries:
             mark = "▶" if entry.start <= now < (entry.end or "23:59") else " "
@@ -300,6 +305,34 @@ class ScheduleCommand(BaseCommand):
         await self._reply("\n".join(lines))
         return True, "ok"
 
+    @cmd_route("diary")
+    async def handle_diary(self) -> tuple[bool, str]:
+        """查看离线生活的日记（它不在线的时候在做什么）。"""
+        service = await self._require_service()
+        if service is None:
+            return False, "service unavailable"
+
+        if not getattr(service.config.offline, "enabled", False):
+            await self._reply(
+                "离线生活还没开启。\n"
+                "在 config/plugins/daily_schedule/config.toml 的 [offline] 里把 enabled "
+                "设为 true，重启之后它就会把不在线的那段时间记下来。\n"
+                "（需要 time_sense 插件配合）"
+            )
+            return True, "disabled"
+
+        days = await service.diary_days(3)
+        blocks = [day.text_block(with_anchors=True) for day in days if not day.is_empty]
+        if not blocks:
+            await self._reply(
+                "还没有日记。\n"
+                "下次它离线超过设定的时长（默认 30 分钟）再启动，就会记上一笔。"
+            )
+            return True, "empty"
+
+        await self._reply("【离线生活】\n\n" + "\n\n".join(blocks))
+        return True, "ok"
+
     @cmd_route("help")
     async def handle_help(self) -> tuple[bool, str]:
         """显示帮助信息。"""
@@ -347,6 +380,11 @@ class ScheduleCommand(BaseCommand):
     async def handle_log_cn(self) -> tuple[bool, str]:
         """查看日志（中文别名）。"""
         return await self.handle_log()
+
+    @cmd_route("日记")
+    async def handle_diary_cn(self) -> tuple[bool, str]:
+        """查看日记（中文别名）。"""
+        return await self.handle_diary()
 
     @cmd_route("帮助")
     async def handle_help_cn(self) -> tuple[bool, str]:

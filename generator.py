@@ -19,7 +19,7 @@ from typing import Any
 
 from src.app.plugin_system.api.log_api import get_logger
 
-from . import llm, sources, store
+from . import diary, llm, sources, store
 from .config import DailyScheduleConfig
 from .models import (
     PERSONA_KIND_ORIGINAL,
@@ -59,6 +59,9 @@ _GENERATE_SYSTEM = """\
 
 硬性要求：
 1. 只输出一个 JSON 对象，不要解释、不要代码围栏、不要多余文字。
+
+【防背书】所有文本字段都是给角色**当背景**用的，不是让它照念的台词：
+用你自己组织的说法写，不要复述人设材料里的原句，也不要写成一句能被整句原样搬走的套话。
 2. entries 必须完整覆盖 00:00 到 23:59：第一条 start 为 "00:00"，最后一条 end 为 "23:59"，
    相邻条目首尾相接、不留空档、不重叠。时间格式固定为 "HH:MM"。
 3. 每条 doing 是「它此刻正在做的事」，用第一人称、现在进行时的一句话，具体、生活化、
@@ -144,7 +147,46 @@ async def _history_block(config: DailyScheduleConfig, today: date_cls) -> str:
         if section:
             blocks.append(f"【{day}】\n" + "\n".join(section))
 
+    diary_text = await _diary_block(config, lookback)
+    if diary_text:
+        blocks.append(diary_text)
+
     return "\n\n".join(blocks)
+
+
+async def _diary_block(config: DailyScheduleConfig, days: int) -> str:
+    """拼出前几天的离线日记，作为「它不在线的时候」的参考。
+
+    日记是真实发生过的事（time_sense 的时间事实 + 记忆缝出来的），回喂它
+    有两个作用：
+
+    1. 今天的安排能与「它昨天做过什么」接上，而不是每天凭空重启一次生活；
+    2. 昨天写下的内容成为今天的素材——日记越写越像同一个人过的一条命，
+       这正是「延续」的来源。
+
+    Args:
+        config: 插件配置。
+        days: 最多取几天。
+
+    Returns:
+        多行文本；没有日记时返回空字符串。
+    """
+    if days <= 0:
+        return ""
+    if not getattr(config.offline, "enabled", False):
+        # 没开离线生活就没有日记；顺手免掉一次存储读取
+        return ""
+
+    try:
+        diaries = await diary.recent_days(days)
+    except Exception as error:  # noqa: BLE001 - 日记层不可用不该影响日程生成
+        logger.warning(f"[daily_schedule] 读取日记失败，跳过日记回喂: {error}")
+        return ""
+
+    blocks = [item.text_block() for item in diaries if not item.is_empty]
+    if not blocks:
+        return ""
+    return "【它不在线的时候（真实发生过的）】\n" + "\n\n".join(blocks)
 
 
 def _build_user_prompt(
