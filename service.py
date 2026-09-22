@@ -62,6 +62,9 @@ _GENERATION_STALE_SECONDS = 900
 #: 唯一权威，还负责在启动时结算离线跨度。两处各算一次时间，迟早会对不上。
 _TIME_SENSE_SIGNATURE = "time_sense:service:time_sense"
 
+#: 同一签名的公开别名——别的模块（比如 plugin 里的自动检测）不必再抄一遍字符串。
+TIME_SENSE_SIGNATURE = _TIME_SENSE_SIGNATURE
+
 #: 本进程的时间基准（本模块被导入的时刻）。用来判断 time_sense 报出的
 #: ``boot_at`` 是不是「本次进程启动之后」的，见 ``wait_time_sense_settled``。
 _PROCESS_START_TS = time.time()
@@ -155,6 +158,24 @@ class ScheduleService(BaseService):
             logger.debug(f"[daily_schedule] 查询 time_sense 失败: {error}")
             return None
         return service if service is not None else None
+
+    def time_sense_available(self) -> bool:
+        """time_sense 是否在位可用（检测机制用）。
+
+        与 :meth:`current_time` 的区别：这里只回答「在不在」，不读时间、不落盘。
+
+        判据是服务实例存在，**且**具备 ``now_snapshot`` 与 ``offline_span`` 两个方法
+        ——按能力认，不按牌子认：万一有别的东西占了同一个签名，能力不对也不认。
+
+        Returns:
+            可用返回 True。
+        """
+        service = self._sense()
+        if service is None:
+            return False
+        return callable(getattr(service, "now_snapshot", None)) and callable(
+            getattr(service, "offline_span", None)
+        )
 
     async def current_time(
         self, *, touch: bool = False, reason: str = ""

@@ -25,7 +25,7 @@ from src.kernel.scheduler import TriggerType, get_unified_scheduler
 from .commands import ScheduleCommand
 from .config import DailyScheduleConfig
 from .handlers import OwnerPresenceHandler, SceneInjectorHandler
-from .service import ScheduleService
+from .service import TIME_SENSE_SIGNATURE, ScheduleService
 
 logger = get_logger("daily_schedule")
 
@@ -93,7 +93,7 @@ class DailySchedulePlugin(BasePlugin):
         "让 Bot 拥有自己的日程：预生成一天、回答「你在做什么」、主人来时让出时间；"
         "配合 time_sense 把「不在线的那段时间」记成日记"
     )
-    plugin_version: str = "1.1.0"
+    plugin_version: str = "1.1.1"
     configs: list[type] = [DailyScheduleConfig]
 
     def __init__(self, config: Any = None) -> None:
@@ -142,6 +142,9 @@ class DailySchedulePlugin(BasePlugin):
         except Exception as error:  # noqa: BLE001 - 报告失败只影响日志
             logger.warning(f"[daily_schedule] 排队启动日程报告失败: {error}")
 
+        if isinstance(self.config, DailyScheduleConfig):
+            self._autodetect_offline()
+
         if isinstance(self.config, DailyScheduleConfig) and self.config.offline.enabled:
             try:
                 task_info = get_task_manager().create_task(
@@ -166,6 +169,56 @@ class DailySchedulePlugin(BasePlugin):
             self._register_task_id = task_info.task_id
         except Exception as error:  # noqa: BLE001 - 注册失败只影响预生成
             logger.warning(f"[daily_schedule] 排队注册预生成任务失败: {error}")
+
+    def _autodetect_offline(self) -> None:
+        """检测机制：装了 time_sense 就自动打开离线生活。
+
+        ``offline.enabled`` 默认是 ``false``，理由是保守——没装时间插件的机器上开着它
+        只会白跑一遍启动结算。但「明明装了时间插件、还得自己去翻配置打开」又太别扭，
+        所以这里补一次检测：**time_sense 在位就自动打开**。
+
+        规则（顺序就是优先级）：
+
+        1. ``offline.enabled`` 已经是 ``true`` → 不动（用户自己开的）；
+        2. ``offline.auto_enable_with_time_sense`` 是 ``false`` → 不自动开
+           （要让离线生活**始终关闭**，把这两项都设 false）；
+        3. time_sense 不在位 → 不自动开（没有时间事实可缝，开了也只剩系统时间）。
+
+        只改**运行时**的配置对象，不回写 ``config.toml``：这是本进程的行为决策，
+        不该偷偷改用户的配置文件。代价是「自动开」这件事在配置里看不出来，
+        所以打开时会打一条 INFO，说清是谁开的、怎么关。
+        """
+        if not isinstance(self.config, DailyScheduleConfig):
+            return
+
+        offline = self.config.offline
+        if offline.enabled:
+            return
+
+        if not getattr(offline, "auto_enable_with_time_sense", True):
+            logger.debug("[daily_schedule] 离线生活未开启，且自动检测已关")
+            return
+
+        from src.app.plugin_system.api import service_api
+
+        try:
+            sense = service_api.get_service(TIME_SENSE_SIGNATURE)
+        except Exception as error:  # noqa: BLE001 - 探测失败按「不在位」处理
+            logger.debug(f"[daily_schedule] 探测 time_sense 失败: {error}")
+            sense = None
+
+        if sense is None or not callable(getattr(sense, "now_snapshot", None)):
+            logger.info(
+                "[daily_schedule] 未检测到 time_sense，离线生活保持关闭"
+                "（装上它之后会自动开启）"
+            )
+            return
+
+        offline.enabled = True
+        logger.info(
+            "[daily_schedule] 检测到 time_sense，已自动开启离线生活"
+            "（想始终关闭：offline.enabled 与 offline.auto_enable_with_time_sense 都设 false）"
+        )
 
     async def on_plugin_unloaded(self) -> None:
         """卸载前：移除巡检任务。

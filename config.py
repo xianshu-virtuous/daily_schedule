@@ -305,21 +305,34 @@ class DailyScheduleConfig(BaseConfig):
 
     @config_section("offline")
     class OfflineSection(SectionBase):
-        """离线生活配置（默认关闭）。
+        """离线生活配置（装了 time_sense 就自动开启）。
 
         开启后，Bot 每次启动都会拿 time_sense 结算出的离线跨度，
         结合当天日程与记忆服务里的真事，缝出一段「我那时在做什么」，
         按天合并成日记存到 ``data/json_storage/daily_schedule/diary-*.json``。
 
-        设计上默认关闭：不开启时行为与 v1.0.0 完全一致，不会多花一次模型调用。
+        ``enabled`` 本身默认 false，但插件加载时会做一次**检测**：
+        只要 time_sense 在位，就自动把它打开（见 ``auto_enable_with_time_sense``）。
+        于是「装了时间插件」等于「离线生活可用」，不用翻配置；
+        反过来，没装 time_sense 时它保持关闭，一次额外的模型调用都不会有。
         """
 
         enabled: bool = Field(
             default=False,
             description=(
                 "是否开启离线生活（把「它不在线的那段时间」记成日记）。\n"
-                "关闭时本插件行为与之前完全一致，不产生额外模型调用。\n"
-                "开启前请确认已安装并启用 time_sense，它是本功能的依赖。"
+                "默认 false，但检测到 time_sense 时会自动置为 true（见下一项）。\n"
+                "想**强制开启**（哪怕没装 time_sense，只记时间事实）：直接设 true。\n"
+                "想**强制关闭**：本项设 false，同时把 auto_enable_with_time_sense 也设 false。"
+            ),
+        )
+        auto_enable_with_time_sense: bool = Field(
+            default=True,
+            description=(
+                "检测到 time_sense（时间感知插件）时，是否自动打开离线生活。\n"
+                "默认开启——装了时间插件就自动记离线日记，省得用户去翻配置。\n"
+                "自动开启只改**运行时**的配置值，不会回写这份 config.toml。\n"
+                "要让离线生活始终关闭，就把本项与 enabled 一起设为 false。"
             ),
         )
         min_seconds: int = Field(

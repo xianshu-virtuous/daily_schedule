@@ -1,7 +1,7 @@
 {
   "name": "daily_schedule",
   "display_name": "日程系统",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "给 Bot 生成自己的生活日程，并作为轻量场景提示注入对话；支持人设/记忆/互联网三层取材、指定模型预生成、主人到场自动让位；配合 time_sense 把「不在线的那段时间」记成日记（默认关闭）。",
   "author": "Aemeath",
   "dependencies": {

@@ -23,7 +23,8 @@
 下次生成日程时再把它当素材读回来——于是「我昨天做了什么」变成**有据可查的一件事**，
 而不是每轮现编的台词。编出来的东西被记下来、下次以事实的身份参与生成，这一环就是闭环。
 
-没有 `time_sense` 也能跑（`dependencies_required = false`），只是离线生活那部分会安静地不做事。
+没有 `time_sense` 也能跑（`dependencies_required = false`），只是离线生活那部分会安静地不做事；
+装上它之后离线生活会被**自动打开**（v1.1.1 起的检测机制），不用手动改配置。
 
 ## 安装
 
@@ -32,10 +33,10 @@
 3. 打开 `plugin.enabled`（默认已开），按需调整 `[model]`（默认用主回复模型 `actor`）与 `[source]`（人设 / 记忆 / 互联网三层素材）；
 4. 无需额外 Python 依赖（`python_dependencies` 为空）；记忆层与联网层都是「有就用、没有就跳过」，不装也能跑。
 
-想让 Bot 拥有「离线生活」（重启后知道自己不在的时候过了多久、做了什么），再装同作者的
-`time_sense`（声明为 `time_sense>=1.0.0`）并打开 `offline.enabled`。它是**可选依赖**：
-没装也不影响日程本身，只是离线生活那部分安静地不做事（`dependencies_required = false`，
-所以缺了也不会被框架裁掉）。
+想让 Bot 拥有「离线生活」（重启后知道自己不在的时候过了多久、做了什么），装上同作者的
+`time_sense`（声明为 `time_sense>=1.0.0`）**就行，不用再改配置**——插件加载时会检测到它，
+并自动打开离线生活。它是**可选依赖**：没装也不影响日程本身，只是离线生活那部分安静地不做事
+（`dependencies_required = false`，所以缺了也不会被框架裁掉）。
 
 装好之后可以用 `/日程` 看状态、`/日程 重生成` 立刻生成一份今天的行程。
 
@@ -139,10 +140,10 @@ booku_memory 等注入器通过换行累加共存，互不覆盖。
 - `scene.yield_idle_minutes`：让位持续的静默时长（默认 30 分钟）；设为 `0` 表示持续到当天结束
 - 让位期间的重复开口不会改措辞、也不会重复记日志
 
-## 离线生活（v1.1.0，默认关闭）
+## 离线生活（v1.1.0 起）
 
 Bot 不在线的那段时间发生了什么，原本**没人知道**：重启之后它只觉得「刚才还在聊」。
-打开离线生活后，每次启动会做这样一件事：
+装上 `time_sense` 之后，**每次启动都会自动做**这样一件事（不用去翻配置）：
 
 ```
 time_sense 结算离线跨度（真的有多久）
@@ -160,8 +161,10 @@ time_sense 结算离线跨度（真的有多久）
 
 几个刻意的设计：
 
-- **默认关闭**（`offline.enabled = false`）：关着的时候，v1.1.0 的行为与 v1.0.0 完全一致，
-  一次额外的模型调用都不会发生
+- **检测机制**：`offline.enabled` 默认是 `false`（保守取值），但插件加载时会检测
+  `time_sense` 在不在——**在位就自动打开**。自动开启只改**运行时**的配置值，不偷改你的
+  `config.toml`；没装 `time_sense` 时它保持关闭，一次额外的模型调用都不会发生。
+  想让离线生活**始终关闭**：`offline.enabled` 与 `offline.auto_enable_with_time_sense` 都设 `false`
 - **它写的是记录，不是台词**：提示词明确要求「材料里没有的一律不写，宁可写得平淡」，
   并写明这段文字是给角色**当背景**的，不是让它照本宣科念出来
 - **同一天只有一份日记**：一天里多次离线会合并进同一份，每个离线段落是一条 entry
@@ -201,7 +204,8 @@ time_sense 结算离线跨度（真的有多久）
 | `[scene]` | `enabled` / `template` / `busy_suffix` / `busy_min_level` / `hint_template` / `note` / `fallback` | 注入文本模板与忙碌许可阈值 |
 | `[scene]` | `reminder_enabled` / `reminder_bucket` / `reminder_name` | 是否走 system reminder 主路、bucket 名（默认 `actor`）、reminder 名（同名覆盖写） |
 | `[scene]` | `yield_enabled` / `yield_min_level` / `yield_scope` / `yield_idle_minutes` / `yield_template` | 让位开关、权限门槛、范围、时长与模板 |
-| `[offline]` | `enabled` / `min_seconds` / `generate_text` | 离线生活总开关、起写门槛（秒）、是否调模型缝文本（关掉则只记时间事实） |
+| `[offline]` | `enabled` / `auto_enable_with_time_sense` | 离线生活总开关（检测到 `time_sense` 会自动置 `true`）、是否允许这种自动开启 |
+| `[offline]` | `min_seconds` / `generate_text` | 起写门槛（秒）、是否调模型缝文本（关掉则只记时间事实） |
 | `[offline]` | `use_schedule_context` / `max_schedule_lines` | 是否拿日程表当锚点、最多取几行 |
 | `[offline]` | `use_memory` / `memory_top_k` / `memory_query` | 记忆锚开关、条数、检索词（留空用默认模板） |
 | `[offline]` | `history_days` / `keep_days` | 回喂几天日记、日记保留天数（更早的自动清理） |
