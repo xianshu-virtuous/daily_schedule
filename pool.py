@@ -48,7 +48,7 @@ from typing import Any
 
 from src.app.plugin_system.api.log_api import get_logger
 
-from . import generator, llm, sources, store
+from . import budget, generator, llm, sources, store
 from .config import DailyScheduleConfig
 from .models import (
     ARCHETYPE_WEEKEND,
@@ -253,44 +253,57 @@ def _user_prompt(
     plan_block: str = "",
 ) -> str:
     """拼出「编一个日型」的用户提示词。"""
-    parts: list[str] = []
+    parts: list[tuple[str, str]] = []
 
     persona_block = bundle.persona_block or snapshot.to_prompt_block()
     if persona_block:
-        parts.append("【人设】\n" + persona_block)
+        parts.append(("人设", persona_block))
 
     profile_block = generator.profile_block(profile)
     if profile_block:
-        parts.append("【人设梳理】\n" + profile_block)
+        parts.append(("人设梳理", profile_block))
 
     if plan_block:
-        parts.append(
-            "【它的年程 / 月程 / 周程（这一套日子要贴着它来编）】\n" + plan_block
-        )
+        parts.append(("它的年程 / 月程 / 周程（这一套日子要贴着它来编）", plan_block))
 
     memory_block = bundle.memory_block()
     if memory_block:
-        parts.append("【关于它的记忆（可能有噪音，只取用得上的）】\n" + memory_block)
+        parts.append(("关于它的记忆（可能有噪音，只取用得上的）", memory_block))
 
     internet_block = bundle.internet_block()
     if internet_block:
-        parts.append("【联网查到的参考（只取与角色日常相关的信息）】\n" + internet_block)
+        parts.append(("联网查到的参考（只取与角色日常相关的信息）", internet_block))
 
     parts.append(
-        f"【要编的日型】{_KIND_LABELS.get(kind, '工作日')} 的第 "
-        f"{len(existing) + 1} 套（已经编过：{'、'.join(existing) if existing else '无'}）。"
-        f"参考日期 {now:%Y-%m-%d}（只用来判断季节与作息氛围，不要写进正文）。"
+        (
+            "要编的日型",
+            f"{_KIND_LABELS.get(kind, '工作日')} 的第 "
+            f"{len(existing) + 1} 套（已经编过：{'、'.join(existing) if existing else '无'}）。"
+            f"参考日期 {now:%Y-%m-%d}（只用来判断季节与作息氛围，不要写进正文）。",
+        )
     )
     if feedback:
-        parts.append("【上一次的问题，务必修正】\n- " + "\n- ".join(feedback.split("；")))
+        parts.append(("上一次的问题，务必修正", feedback.replace("；", "\n- ")))
 
     parts.append(
-        f"请按格式输出这个日型：{max(2, int(config.schedule.min_entries))}-"
-        f"{max(2, int(config.schedule.max_entries))} 段、每段 "
-        f"{max(2, min(4, int(config.pool.variants_per_slot)))} 个场景一致的变体，"
-        "并带上 5-6 条 yield_lines。"
+        (
+            "格式",
+            f"请按格式输出这个日型：{max(2, int(config.schedule.min_entries))}-"
+            f"{max(2, int(config.schedule.max_entries))} 段、每段 "
+            f"{max(2, min(4, int(config.pool.variants_per_slot)))} 个场景一致的变体，"
+            "并带上 5-6 条 yield_lines。",
+        )
     )
-    return "\n\n".join(parts)
+
+    # 预算闸：人设和格式要求不许丢，联网/记忆/规划材料按优先级丢
+    text, notes = budget.fit(
+        parts,
+        limit=int(getattr(config.budget, "max_prompt_chars", 12000)),
+        keep=("人设", "人设梳理", "要编的日型", "格式"),
+    )
+    for note in notes:
+        logger.warning(f"[daily_schedule] 日型提示词{note}")
+    return text
 
 
 async def build_archetype(

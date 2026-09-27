@@ -10,6 +10,7 @@
     /日程 重规划 /replan      — 重新生成三层规划（后台执行）
     /日程 池     /pool        — 查看日程池（日型、变体、有效期）
     /日程 刷池   /refresh-pool— 重编日程池（后台执行，几分钟）
+    /日程 用量   /usage       — 模型调用用量（输入大小 / 每轮注入量）
     /日程 人设   /persona     — 查看人设类型判定结果
     /日程 让位   /yield       — 手动让位（主人到场验证用）
     /日程 收回   /unyield     — 结束让位，恢复日程
@@ -48,6 +49,7 @@ _USAGE = """\
   重规划 / replan      — 重新生成三层规划（后台执行）
   池 / pool            — 查看日程池（日型 / 变体 / 有效期）
   刷池 / refresh-pool  — 重编日程池（后台执行）
+  用量 / usage         — 模型调用用量（输入大小 / 每轮注入量）
   人设 / persona       — 查看人设类型判定
   让位 / yield         — 手动让位（验证用）
   收回 / unyield       — 结束让位
@@ -269,6 +271,23 @@ class ScheduleCommand(BaseCommand):
         )
         return True, "ok"
 
+    @cmd_route("usage")
+    async def handle_usage(self) -> tuple[bool, str]:
+        """查看模型调用用量（输入大小 / 每轮注入量 / 退避状态）。"""
+        service = await self._require_service()
+        if service is None:
+            return False, "service unavailable"
+
+        lines = ["【模型调用用量】"]
+        lines.extend(await service.usage_lines())
+        status = await service.status()
+        if status.get("generating"):
+            lines.append("  当前状态：正在生成")
+        if status.get("last_error"):
+            lines.append(f"  上次失败：{status['last_error']}")
+        await self._reply("\n".join(lines))
+        return True, "ok"
+
     @cmd_route("plans")
     async def handle_plans(self) -> tuple[bool, str]:
         """查看三层规划：年程 / 月程 / 周程。"""
@@ -451,6 +470,11 @@ class ScheduleCommand(BaseCommand):
     async def handle_pool_cn(self) -> tuple[bool, str]:
         """查看日程池（中文别名）。"""
         return await self.handle_pool()
+
+    @cmd_route("用量")
+    async def handle_usage_cn(self) -> tuple[bool, str]:
+        """查看模型调用用量（中文别名）。"""
+        return await self.handle_usage()
 
     @cmd_route("规划")
     async def handle_plans_cn(self) -> tuple[bool, str]:

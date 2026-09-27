@@ -411,6 +411,48 @@ class DailyScheduleConfig(BaseConfig):
             ),
         )
 
+    @config_section("budget")
+    class BudgetSection(SectionBase):
+        """用量闸门：提示词预算、告警线。
+
+        防的是一个真实事故形状：**一次性的巨大请求（前缀没有可复用的东西）**
+        ——API 侧没有缓存命中、程序侧还要跟着重建一遍上下文，两头一起炸。
+        本插件的每一次模型调用都是自带材料的小请求，这里给材料配上硬上限：
+
+        - 超过 ``max_prompt_chars``：按优先级丢材料（先丢联网、再丢记忆、最后丢历史），
+          人设这种"不能丢"的段用 ``keep`` 标着不动；丢完还超就末尾硬截断；
+        - 超过 ``warn_prompt_chars``：日志里 WARNING 一次，方便早发现"悄悄长起来"。
+
+        单位是**字符**（中文字符 ≈ 1 token 量级，当上界够保守），不需要分词器依赖。
+        """
+
+        max_prompt_chars: int = Field(
+            default=12000,
+            description=(
+                "单次模型调用的输入硬上限（字符）。\n"
+                "本插件的调用（日型池 / 规划 / 日记）正常都在 2k-6k 字符量级，\n"
+                "给到 12000 是留足余量；超了会先丢可牺牲的材料，并记一条 WARNING。"
+            ),
+        )
+        warn_prompt_chars: int = Field(
+            default=8000,
+            description="输入超过这个字符数就告警（不截断），用来早发现异常增长。",
+        )
+        note_injection: bool = Field(
+            default=True,
+            description=(
+                "是否统计「每轮往对话里注入多少字符」（进程内计数，每 20 轮落盘一次）。\n"
+                "统计结果在 /日程 用量 里，用来证明注入量是固定的、不随对话变长。"
+            ),
+        )
+        fail_backoff: bool = Field(
+            default=True,
+            description=(
+                "模型调用连续失败时是否退避（60→120→240…封顶 1800 秒）。\n"
+                "默认开：防止「失败就立刻重试」把 token 打爆（另一个真实事故里一晚上烧了几百次）。"
+            ),
+        )
+
     @config_section("scene")
     class SceneSection(SectionBase):
         """场景提示与让位配置。
@@ -696,6 +738,7 @@ class DailyScheduleConfig(BaseConfig):
     pool: PoolSection = Field(default_factory=PoolSection)
     plan: PlanSection = Field(default_factory=PlanSection)
     progress: ProgressSection = Field(default_factory=ProgressSection)
+    budget: BudgetSection = Field(default_factory=BudgetSection)
     scene: SceneSection = Field(default_factory=SceneSection)
     log: LogSection = Field(default_factory=LogSection)
     offline: OfflineSection = Field(default_factory=OfflineSection)

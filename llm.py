@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,6 +24,7 @@ from src.app.plugin_system.api import llm_api
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.types import LLMPayload, ROLE, Text
 
+from . import budget
 from .config import DailyScheduleConfig
 
 logger = get_logger("daily_schedule.llm")
@@ -369,6 +371,10 @@ async def call(
 ) -> LLMCallResult:
     """执行一次单轮模型调用。
 
+    每次调用都会**体检 + 记账**：拼出来的输入超过预算会先告警（超硬上限说明某个调用点
+    漏了 ``budget.fit``），并把「用途 / 输入字符 / 输出字符 / 耗时」记进有界的统计文件，
+    ``/日程 用量`` 直接看得到。会不会把 token 打爆不该靠猜。
+
     Args:
         config: 插件配置。
         system_prompt: 系统提示词。
@@ -380,13 +386,27 @@ async def call(
     Returns:
         调用结果。
     """
+    budget.check_prompt(config, request_name=request_name, prompt=user_prompt)
+    started = time.monotonic()
+    prompt_chars = len(system_prompt or "") + len(user_prompt or "")
+
+    async def _finish(result: LLMCallResult) -> LLMCallResult:
+        await budget.record_call(
+            request_name=request_name,
+            prompt_chars=prompt_chars,
+            output_chars=len(result.text or ""),
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            ok=result.ok,
+        )
+        return result
+
     try:
         model_set, model_tag = resolve_model_set(
             config, temperature=temperature, max_tokens=max_tokens
         )
     except Exception as error:  # noqa: BLE001 - 模型解析失败按调用失败处理
         logger.warning(f"[daily_schedule] 解析模型集失败: {error}")
-        return LLMCallResult(ok=False, error=f"resolve model set: {error}")
+        return await _finish(LLMCallResult(ok=False, error=f"resolve model set: {error}"))
 
     try:
         request = llm_api.create_llm_request(model_set, request_name=request_name)
@@ -396,12 +416,14 @@ async def call(
         await response
     except Exception as error:  # noqa: BLE001 - 调用失败按失败结果返回
         logger.warning(f"[daily_schedule] 模型调用失败: {error}")
-        return LLMCallResult(ok=False, model_tag=model_tag, error=str(error))
+        return await _finish(LLMCallResult(ok=False, model_tag=model_tag, error=str(error)))
 
     text = extract_text(response)
     if not text:
-        return LLMCallResult(ok=False, model_tag=model_tag, error="empty response")
-    return LLMCallResult(ok=True, text=text, model_tag=model_tag)
+        return await _finish(
+            LLMCallResult(ok=False, model_tag=model_tag, error="empty response")
+        )
+    return await _finish(LLMCallResult(ok=True, text=text, model_tag=model_tag))
 
 
 __all__ = [

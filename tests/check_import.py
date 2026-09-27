@@ -55,6 +55,7 @@ MODULES = [
     "daily_schedule.pool",
     "daily_schedule.plan",
     "daily_schedule.progress",
+    "daily_schedule.budget",
     "daily_schedule.diary",
     "daily_schedule.generator",
     "daily_schedule.service",
@@ -180,6 +181,10 @@ check("progress.interrupt_penalty 默认 0.2", abs(float(config.progress.interru
 check("progress.inject_mood 默认关", bool(config.progress.inject_mood) is False)
 check("plan.enabled 默认开", bool(config.plan.enabled) is True)
 check("plan.announce_year 默认开（元旦分享年目标）", bool(config.plan.announce_year) is True)
+check("budget.max_prompt_chars 默认 12000（单次输入硬上限）", int(config.budget.max_prompt_chars) == 12000)
+check("budget.warn_prompt_chars 默认 8000", int(config.budget.warn_prompt_chars) == 8000)
+check("budget.fail_backoff 默认开（不许失败就重试）", bool(config.budget.fail_backoff) is True)
+check("budget.note_injection 默认开（统计每轮注入量）", bool(config.budget.note_injection) is True)
 for layer in ("year", "month", "week"):
     check(f"plan.{layer}_mode 默认 pool", str(getattr(config.plan, f"{layer}_mode")) == "pool")
 check("plan.inject_in_chat 默认关（规划不占每轮 token）", bool(config.plan.inject_in_chat) is False)
