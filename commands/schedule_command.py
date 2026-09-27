@@ -149,6 +149,31 @@ class ScheduleCommand(BaseCommand):
         status: dict[str, Any] = await service.status()
         lines = [f"【日程 {status['date']}】"]
 
+        # 时间源现状：对面是 time_sense 1.x 还是 2.x、哪些能力在位，一眼看清。
+        # 离线日记的「可信区间」说明只有 2.0 才有，所以这行对排查很关键。
+        sense = service.time_sense_info()
+        if sense["available"]:
+            if sense["version"]:
+                version_text = f"time_sense v{sense['version']}"
+            else:
+                version_text = "time_sense（1.x，无能力清单）"
+            feature_bits: list[str] = []
+            features = sense["features"]
+            if features.get("per_stream_clock"):
+                feature_bits.append("按流时钟")
+            if features.get("gap_semantics"):
+                feature_bits.append("间隔语义")
+            if features.get("timeline"):
+                feature_bits.append("时间线账本")
+            if features.get("events_enabled"):
+                feature_bits.append("时间事件")
+            if sense["gap_precision"]:
+                feature_bits.append("离线可信区间")
+            detail = f"（{'，'.join(feature_bits)}）" if feature_bits else ""
+            lines.append(f"  时间源：{version_text}{detail}")
+        else:
+            lines.append("  时间源：系统时间（未检测到 time_sense）")
+
         if status["mode"] == "pool":
             pool_hint = f"池子 {status['pool_id']}" if status.get("pool_id") else "池子还没编好"
             lines.append(f"  模式：日程池（{pool_hint}）")

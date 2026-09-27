@@ -325,6 +325,55 @@ class ScheduleService(BaseService):
                 return False
             await asyncio.sleep(0.5)
 
+    def time_sense_info(self) -> dict[str, Any]:
+        """报告时间源的能力与版本（诊断用，不读时间、不落盘）。
+
+        time_sense 2.0 起提供 ``capabilities()``：能按流看时钟、有时隔语义、
+        有时间线账本、会用事件广播跨天与久别。这里把它摘成一个稳定的字典，
+        让 ``/日程 查看`` 能一眼看出「对面是老版本还是新版本、哪些能力在位」——
+        离线日记的可信度说明（``seconds_min`` / ``clock_ok``）就靠它区分。
+
+        Returns:
+            含 ``available`` / ``version`` / ``storage_namespace`` / ``features`` /
+            ``events`` / ``gap_precision`` 的字典。老版本没有 ``capabilities()``
+            时 ``version`` 为空串、``features`` 为空字典，其余字段照给。
+        """
+        info: dict[str, Any] = {
+            "available": False,
+            "version": "",
+            "storage_namespace": "",
+            "features": {},
+            "events": {},
+            "gap_precision": False,
+        }
+        service = self._sense()
+        if service is None:
+            return info
+
+        info["available"] = self.time_sense_available()
+        caps_fn = getattr(service, "capabilities", None)
+        if not callable(caps_fn):
+            return info
+
+        try:
+            caps = caps_fn()
+        except Exception as error:  # noqa: BLE001 - 探测失败按老版本处理
+            logger.debug(f"[daily_schedule] 读取 time_sense 能力失败: {error}")
+            return info
+
+        if not isinstance(caps, dict):
+            return info
+
+        features = caps.get("features")
+        info["version"] = str(caps.get("version") or "")
+        info["storage_namespace"] = str(caps.get("storage_namespace") or "")
+        info["features"] = dict(features) if isinstance(features, dict) else {}
+        events = caps.get("events")
+        info["events"] = dict(events) if isinstance(events, dict) else {}
+        # 「离线跨度带区间与时钟健康」是 v2 的 offline_span 才有的字段。
+        info["gap_precision"] = bool(info["features"].get("clock_health"))
+        return info
+
     async def offline_settlement(self) -> dict[str, Any]:
         """启动结算：把「它不在线的这段时间」记成日记。
 

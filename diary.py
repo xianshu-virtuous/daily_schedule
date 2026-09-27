@@ -494,6 +494,48 @@ def entries_within(
     return lines
 
 
+def describe_span_precision(span: dict[str, Any]) -> str:
+    """把离线跨度的**可信度**说清楚（time_sense 2.0 才开始给这些字段）。
+
+    time_sense 1.x 只给一个 ``seconds``，日记就只能照抄一个精确值。问题是进程被
+    强杀 / 断电时走不到退出钩子，真实离线时长其实落在一个心跳周期宽的区间里；
+    系统时钟被改过的话，连这个区间都不成立。
+
+    2.0 补上了 ``seconds_min`` / ``seconds_max`` / ``uncertainty_seconds`` /
+    ``clock_ok``，于是这里可以据实说明：不确定就给区间，时钟异常就直说不可信。
+
+    老版本 span 没有这些键 → 一律返回空字符串，行为与从前完全一致。
+
+    Args:
+        span: ``time_sense.offline_span()`` 的返回。
+
+    Returns:
+        括号说明；无需说明时为空字符串。
+    """
+    if not isinstance(span, dict):
+        return ""
+
+    uncertain = _as_float(span.get("uncertainty_seconds"))
+    clock_ok = span.get("clock_ok", True)
+    low = _as_float(span.get("seconds_min"))
+    high = _as_float(span.get("seconds_max"))
+
+    if clock_ok is False:
+        if high > 0:
+            return (
+                f"（系统时钟被改动过，真实跨度只可信到 "
+                f"{humanize_duration(low)}~{humanize_duration(high)} 之间）"
+            )
+        return "（系统时钟被改动过，这段跨度不可信）"
+
+    if uncertain >= 60 and high > low:
+        return (
+            f"（±{humanize_duration(uncertain)}：进程被强杀时最多差一个心跳，"
+            f"真实跨度在 {humanize_duration(low)}~{humanize_duration(high)} 之间）"
+        )
+    return ""
+
+
 def describe_span_anchor(span: dict[str, Any]) -> str:
     """渲染时间锚文本。
 
@@ -501,12 +543,15 @@ def describe_span_anchor(span: dict[str, Any]) -> str:
         span: ``time_sense.offline_span()`` 的返回。
 
     Returns:
-        一行锚点描述。
+        一行锚点描述（含可信度说明，time_sense 2.0 起）。
     """
     seconds = _as_float(span.get("seconds"))
     days = int(_as_float(span.get("days")))
     text = _as_text(span.get("text"), 40) or humanize_duration(seconds)
-    return f"time_sense 结算离线 {text}（跨 {days} 个自然日）"
+    return (
+        f"time_sense 结算离线 {text}（跨 {days} 个自然日）"
+        f"{describe_span_precision(span)}"
+    )
 
 
 def build_anchors(
@@ -631,7 +676,8 @@ def _build_prompt(
             f"它回来的时刻：{date_of(to_ts)} {clock_of(to_ts)}\n"
             f"中间隔了 {humanize_duration(seconds)}"
             f"（time_sense 结算值 {span.get('text') or humanize_duration(seconds)}，"
-            f"跨 {int(_as_float(span.get('days')))} 个自然日）。\n"
+            f"跨 {int(_as_float(span.get('days')))} 个自然日）"
+            f"{describe_span_precision(span)}。\n"
             "这段时间它不在线上，需要你补写它当时在做什么。",
         )
     )
@@ -927,6 +973,7 @@ __all__ = [
     "compose",
     "date_of",
     "describe_span_anchor",
+    "describe_span_precision",
     "entries_within",
     "humanize_duration",
     "load_day",
