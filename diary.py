@@ -165,6 +165,7 @@ class DiaryEntry:
         source: 正文来源：``llm`` 模型缝合 / ``fact`` 只有事实 / ``fallback`` 兜底。
         model_tag: 实际生成用的模型标识。
         anchors: 本次缝合用到的真实素材摘要（事后可核对，见模块文档的「三只锚」）。
+        outcomes: 本次离线结算时对「周程 / 月程推进项」的随机评估结果（留档可核对）。
         boot_count: time_sense 的启动序号，便于对齐两边日志。
     """
 
@@ -175,6 +176,7 @@ class DiaryEntry:
     source: str = "llm"
     model_tag: str = ""
     anchors: list[str] = field(default_factory=list)
+    outcomes: list[str] = field(default_factory=list)
     boot_count: int = 0
 
     @property
@@ -215,6 +217,7 @@ class DiaryEntry:
             "source": self.source,
             "model_tag": self.model_tag,
             "anchors": list(self.anchors),
+            "outcomes": list(self.outcomes),
             "boot_count": self.boot_count,
         }
 
@@ -238,6 +241,7 @@ class DiaryEntry:
             source=_as_text(raw.get("source"), 16) or "llm",
             model_tag=_as_text(raw.get("model_tag"), 64),
             anchors=_as_str_list(raw.get("anchors"), _MAX_ANCHORS),
+            outcomes=_as_str_list(raw.get("outcomes"), _MAX_ANCHORS),
             boot_count=int(_as_float(raw.get("boot_count"))),
         )
 
@@ -310,6 +314,8 @@ class DiaryDay:
                 anchor = entry.anchor_line()
                 if anchor:
                     lines.append(f"  {anchor}")
+                if entry.outcomes:
+                    lines.append("  这次评估：" + "；".join(entry.outcomes))
         return "\n".join(lines)
 
     def to_dict(self) -> dict[str, Any]:
@@ -591,6 +597,8 @@ def _build_prompt(
     memory_notes: list[str],
     history: str,
     now: datetime,
+    plan_block: str = "",
+    outcome_lines: str = "",
 ) -> str:
     """组装缝合用的用户提示词。
 
@@ -604,6 +612,8 @@ def _build_prompt(
         memory_notes: 记忆锚条目。
         history: 更早的日记文本。
         now: 当前时间。
+        plan_block: 年 / 月 / 周程文本（它正在推进的事）。
+        outcome_lines: 随机评估结果（这一周 / 这一月的推进顺利还是卡住了）。
 
     Returns:
         用户提示词。
@@ -623,6 +633,17 @@ def _build_prompt(
         f"跨 {int(_as_float(span.get('days')))} 个自然日）。\n"
         "这段时间它不在线上，需要你补写它当时在做什么。"
     )
+
+    if plan_block:
+        parts.append("【它正在推进的事（年程 / 月程 / 周程）】\n" + plan_block)
+
+    if outcome_lines:
+        parts.append(
+            "【这次的结果：真实发生，不可修改】\n"
+            + outcome_lines
+            + "\n这几件事的结果就长这样——顺利的要写出一点踏实或高兴，"
+            "卡住的要写出一点低落或不甘心，别把两种结果写成同一种语气。"
+        )
 
     if schedule_lines:
         parts.append(
@@ -655,6 +676,8 @@ async def compose(
     memory_notes: list[str],
     history: str,
     now: datetime,
+    plan_block: str = "",
+    outcome_lines: str = "",
 ) -> tuple[str, str, str]:
     """调用模型把真实材料缝成一段生活。
 
@@ -682,6 +705,8 @@ async def compose(
         memory_notes=memory_notes,
         history=history,
         now=now,
+        plan_block=plan_block,
+        outcome_lines=outcome_lines,
     )
     if config.plugin.debug_log:
         logger.debug(f"[daily_schedule] 离线日记提示词：\n{prompt}")
@@ -720,6 +745,9 @@ async def record_offline(
     *,
     now: datetime | None = None,
     persona_block: str | None = None,
+    plan_block: str = "",
+    outcome_lines: str = "",
+    outcomes: list[str] | None = None,
 ) -> DiaryEntry | None:
     """把一次启动结算出的离线跨度写成当天日记。
 
@@ -735,6 +763,9 @@ async def record_offline(
         span: ``time_sense.offline_span()`` 的返回。
         now: 结算时刻，默认当前时间。
         persona_block: 人设文本块；``None`` 表示自己读。
+        plan_block: 年 / 月 / 周程文本（它正在推进的事）。
+        outcome_lines: 随机评估结果的渲染文本（喂给缝合提示词）。
+        outcomes: 随机评估结果的原始条目（留档在日记里，事后可核对）。
 
     Returns:
         写入的条目；未记录时返回 ``None``。
@@ -825,6 +856,8 @@ async def record_offline(
             memory_notes=memory_notes,
             history=history,
             now=moment,
+            plan_block=plan_block,
+            outcome_lines=outcome_lines,
         )
         if text:
             source = "llm"
@@ -837,6 +870,7 @@ async def record_offline(
         source=source,
         model_tag=model_tag,
         anchors=build_anchors(span, schedule_lines, memory_notes),
+        outcomes=list(outcomes or [])[:_MAX_ANCHORS],
         boot_count=int(_as_float(span.get("boot_count"))),
     )
 
@@ -844,6 +878,16 @@ async def record_offline(
     if summary:
         diary.summary = summary
     await save_day(diary)
+
+    # 新日记写好了：把「可以注入几轮」的计数器上膛（限次注入，见 service.diary_injection）
+    try:
+        inject_turns = max(0, int(getattr(offline, "inject_turns", 3)))
+        if inject_turns > 0 and bool(getattr(offline, "inject_enabled", False)):
+            state = await store.load_state()
+            state.diary_inject_left = inject_turns
+            await store.save_state(state)
+    except Exception as error:  # noqa: BLE001 - 计数器写不进去不该影响日记
+        logger.warning(f"[daily_schedule] 记录日记注入轮数失败: {error}")
 
     removed = await store.prune_diaries(int(getattr(offline, "keep_days", 30)))
     if removed:

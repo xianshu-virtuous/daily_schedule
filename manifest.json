@@ -1,13 +1,11 @@
 {
   "name": "daily_schedule",
   "display_name": "日程系统",
-  "version": "1.1.1",
-  "description": "给 Bot 生成自己的生活日程，并作为轻量场景提示注入对话；支持人设/记忆/互联网三层取材、指定模型预生成、主人到场自动让位；配合 time_sense 把「不在线的那段时间」记成日记（默认关闭）。",
+  "version": "1.2.0",
+  "description": "给 Bot 一份有自己的时间的生活：三层规划（年程→月程→周程）逐层定方向，日程层用「日程池」每日轮换抽取（日型×变体，不重样且每天不花额外调用）；支持人设/记忆/互联网三层取材、主人到场只在触发会话让位、离线回来对周月推进项做一次「八成顺利/两成卡住」的随机评估并记进日记。",
   "author": "Aemeath",
   "dependencies": {
-    "plugins": [
-      "time_sense>=1.0.0"
-    ],
+    "plugins": [],
     "components": []
   },
   "include": [

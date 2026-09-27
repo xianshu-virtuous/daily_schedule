@@ -48,6 +48,12 @@ SCHEDULE_PREFIX = "schedule-"
 #: day 日记键前缀。
 DIARY_PREFIX = "diary-"
 
+#: 当前生效的日程池键。
+POOL_KEY = "pool-current"
+
+#: 正在编、还没编完的日程池键（增量落盘，重启接着编）。
+POOL_STAGING_KEY = "pool-staging"
+
 
 def schedule_key(date_str: str) -> str:
     """生成某天日程的存储键。
@@ -210,6 +216,214 @@ async def recent_log_dates(limit: int) -> list[str]:
     return dates[: max(0, limit)]
 
 
+async def recent_schedule_dates(limit: int) -> list[str]:
+    """列出最近有日程的日期。
+
+    Args:
+        limit: 返回条数上限（按日期倒序）。
+
+    Returns:
+        日期字符串列表（``YYYY-MM-DD``，倒序）。
+    """
+    try:
+        names = await storage_api.list_json(STORE_NAME)
+    except Exception as error:  # noqa: BLE001 - 存储异常不应影响对话主流程
+        logger.warning(f"[daily_schedule] 列出存储键失败: {error}")
+        return []
+
+    dates = sorted(
+        (name[len(SCHEDULE_PREFIX) :] for name in names if name.startswith(SCHEDULE_PREFIX)),
+        reverse=True,
+    )
+    return dates[: max(0, limit)]
+
+
+# ── 日程池 ────────────────────────────────────────────────────────────────────
+#
+# 两个键：``pool-current`` 是正在用的池子，``pool-staging`` 是正在编的半成品。
+# 分开的理由是"写坏率"：刷池失败时旧池子必须原封不动，编了一半也得能接着编。
+
+
+async def load_pool() -> "SchedulePool | None":
+    """读取当前生效的日程池。
+
+    Returns:
+        池子实例；不存在或数据不可用时返回 ``None``。
+    """
+    from .models import SchedulePool
+
+    return SchedulePool.from_dict(await _load_raw(POOL_KEY))
+
+
+async def save_pool(pool: "SchedulePool") -> bool:
+    """写入当前生效的日程池。"""
+    return await _save_raw(POOL_KEY, pool.to_dict())
+
+
+async def load_pool_staging() -> "SchedulePool | None":
+    """读取正在编的日程池半成品。"""
+    from .models import SchedulePool
+
+    return SchedulePool.from_dict(await _load_raw(POOL_STAGING_KEY))
+
+
+async def save_pool_staging(pool: "SchedulePool") -> bool:
+    """写入日程池半成品（每编好一个日型就落一次，重启接着编）。"""
+    return await _save_raw(POOL_STAGING_KEY, pool.to_dict())
+
+
+async def delete_pool_staging() -> bool:
+    """删掉半成品（池子正式替换后调用）。"""
+    try:
+        await storage_api.delete_json(STORE_NAME, POOL_STAGING_KEY)
+        return True
+    except Exception as error:  # noqa: BLE001 - 删不掉只是多占一个键
+        logger.warning(f"[daily_schedule] 清理 {POOL_STAGING_KEY} 失败: {error}")
+        return False
+
+
+async def recent_schedules(limit: int) -> list["DailySchedule"]:
+    """读取最近几天的日程（最近的在前）。
+
+    抽取日型时要靠它避开"刚用过的日型"，也要靠它避开"昨天同一时段的同一句话"。
+
+    Args:
+        limit: 天数上限。
+
+    Returns:
+        日程列表；没有记录时返回空列表。
+    """
+    days: list[DailySchedule] = []
+    for date_str in await recent_schedule_dates(limit):
+        schedule = await load_schedule(date_str)
+        if schedule is not None and not schedule.is_empty:
+            days.append(schedule)
+    return days
+
+
+# ── 三层规划（年 / 月 / 周） ──────────────────────────────────────────────────
+#
+# 每层每个时期一个键（``plan-week-2026-W40``），型池两个键（``plan-pool-week`` /
+# ``plan-pool-week-staging``）。为什么不像日程那样只留"当前"：规划链要能回溯——
+# 生成下一期时要看上一期实际怎么样（以及随机评估的结果），所以按时期存。
+
+
+#: 规划层键前缀。
+PLAN_PREFIX = "plan-"
+
+#: 规划型池键前缀。
+PLAN_POOL_PREFIX = "plan-pool-"
+
+
+def plan_key(layer: str, period: str) -> str:
+    """生成某一层某个时期的存储键。
+
+    Args:
+        layer: ``year`` / ``month`` / ``week``。
+        period: 时期标识。
+
+    Returns:
+        存储键名。
+    """
+    return f"{PLAN_PREFIX}{layer}-{period}"
+
+
+def plan_pool_key(layer: str, *, staging: bool = False) -> str:
+    """生成某一层型池的存储键。"""
+    suffix = "-staging" if staging else ""
+    return f"{PLAN_POOL_PREFIX}{layer}{suffix}"
+
+
+async def load_plan(layer: str, period: str) -> "PeriodPlan | None":
+    """读取某一层某个时期的计划。"""
+    from .models import PeriodPlan
+
+    return PeriodPlan.from_dict(await _load_raw(plan_key(layer, period)))
+
+
+async def save_plan(plan: "PeriodPlan") -> bool:
+    """写入某一层某个时期的计划。"""
+    return await _save_raw(plan_key(plan.layer, plan.period), plan.to_dict())
+
+
+async def load_previous_plan(layer: str, offset: int) -> "PeriodPlan | None":
+    """读取这一层往前数第 N 期的计划（offset=1 即上一期）。
+
+    用来做两件事：看上一期实际怎样（给下一期当材料）、以及避开连着抽同一种走向。
+
+    Args:
+        layer: 规划层。
+        offset: 往前数几期（从 1 开始）。
+
+    Returns:
+        计划实例；没有时返回 ``None``。
+    """
+    from .models import PeriodPlan
+
+    dates = await recent_plan_periods(layer, offset + 1)
+    if len(dates) <= offset:
+        return None
+    return PeriodPlan.from_dict(await _load_raw(plan_key(layer, dates[offset])))
+
+
+async def recent_plan_periods(layer: str, limit: int) -> list[str]:
+    """列出某一层最近有记录的时期（倒序）。
+
+    Args:
+        layer: 规划层。
+        limit: 条数上限。
+
+    Returns:
+        时期标识列表（倒序）。
+    """
+    prefix = f"{PLAN_PREFIX}{layer}-"
+    try:
+        names = await storage_api.list_json(STORE_NAME)
+    except Exception as error:  # noqa: BLE001 - 存储异常不应影响对话主流程
+        logger.warning(f"[daily_schedule] 列出规划键失败: {error}")
+        return []
+
+    periods = sorted(
+        (name[len(prefix) :] for name in names if name.startswith(prefix)),
+        reverse=True,
+    )
+    return periods[: max(0, limit)]
+
+
+async def load_plan_pool(layer: str) -> "PlanPool | None":
+    """读取某一层的型池。"""
+    from .models import PlanPool
+
+    return PlanPool.from_dict(await _load_raw(plan_pool_key(layer)))
+
+
+async def save_plan_pool(pool: "PlanPool") -> bool:
+    """写入某一层的型池。"""
+    return await _save_raw(plan_pool_key(pool.layer), pool.to_dict())
+
+
+async def load_plan_pool_staging(layer: str) -> "PlanPool | None":
+    """读取某一层正在编的型池半成品。"""
+    from .models import PlanPool
+
+    return PlanPool.from_dict(await _load_raw(plan_pool_key(layer, staging=True)))
+
+
+async def save_plan_pool_staging(pool: "PlanPool") -> bool:
+    """写入某一层型池的半成品（编好一套落一次）。"""
+    return await _save_raw(plan_pool_key(pool.layer, staging=True), pool.to_dict())
+
+
+async def delete_plan_pool_staging(layer: str) -> bool:
+    """删掉某一层型池的半成品（整池替换后调用）。"""
+    try:
+        await storage_api.delete_json(STORE_NAME, plan_pool_key(layer, staging=True))
+        return True
+    except Exception as error:  # noqa: BLE001 - 删不掉只是多占一个键
+        logger.warning(f"[daily_schedule] 清理 {layer} 型池半成品失败: {error}")
+        return False
+
+
 async def load_persona_profile() -> PersonaProfile | None:
     """读取人设判定缓存。
 
@@ -354,22 +568,44 @@ __all__ = [
     "DIARY_PREFIX",
     "LOG_PREFIX",
     "PERSONA_KEY",
+    "PLAN_POOL_PREFIX",
+    "PLAN_PREFIX",
+    "POOL_KEY",
+    "POOL_STAGING_KEY",
     "SCHEDULE_PREFIX",
     "STATE_KEY",
     "STORE_NAME",
+    "delete_plan_pool_staging",
+    "delete_pool_staging",
     "diary_key",
     "load_diary",
     "load_log",
     "load_persona_profile",
+    "load_plan",
+    "load_plan_pool",
+    "load_plan_pool_staging",
+    "load_pool",
+    "load_pool_staging",
+    "load_previous_plan",
     "load_schedule",
     "load_state",
     "log_key",
+    "plan_key",
+    "plan_pool_key",
     "prune_diaries",
     "recent_diary_dates",
     "recent_log_dates",
+    "recent_plan_periods",
+    "recent_schedule_dates",
+    "recent_schedules",
     "save_diary",
     "save_log",
     "save_persona_profile",
+    "save_plan",
+    "save_plan_pool",
+    "save_plan_pool_staging",
+    "save_pool",
+    "save_pool_staging",
     "save_schedule",
     "save_state",
     "schedule_key",

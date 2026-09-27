@@ -6,6 +6,10 @@
     /日程 查看   /status      — 状态摘要
     /日程 全天   /today       — 列出今天的全部时段
     /日程 重生成 /regenerate  — 强制重新生成今天的日程（后台执行）
+    /日程 规划   /plans       — 年程 / 月程 / 周程（三层规划）
+    /日程 重规划 /replan      — 重新生成三层规划（后台执行）
+    /日程 池     /pool        — 查看日程池（日型、变体、有效期）
+    /日程 刷池   /refresh-pool— 重编日程池（后台执行，几分钟）
     /日程 人设   /persona     — 查看人设类型判定结果
     /日程 让位   /yield       — 手动让位（主人到场验证用）
     /日程 收回   /unyield     — 结束让位，恢复日程
@@ -40,6 +44,10 @@ _USAGE = """\
   查看 / status        — 此刻在做什么（默认）
   全天 / today         — 列出今天全部时段
   重生成 / regenerate  — 强制重新生成今天的日程
+  规划 / plans         — 年程 / 月程 / 周程（三层规划）
+  重规划 / replan      — 重新生成三层规划（后台执行）
+  池 / pool            — 查看日程池（日型 / 变体 / 有效期）
+  刷池 / refresh-pool  — 重编日程池（后台执行）
   人设 / persona       — 查看人设类型判定
   让位 / yield         — 手动让位（验证用）
   收回 / unyield       — 结束让位
@@ -139,11 +147,19 @@ class ScheduleCommand(BaseCommand):
         status: dict[str, Any] = await service.status()
         lines = [f"【日程 {status['date']}】"]
 
+        if status["mode"] == "pool":
+            pool_hint = f"池子 {status['pool_id']}" if status.get("pool_id") else "池子还没编好"
+            lines.append(f"  模式：日程池（{pool_hint}）")
+        else:
+            lines.append("  模式：每日生成")
+
         if status["has_schedule"]:
             lines.append(
                 f"  条目：{status['entries']} 条"
                 f"（生成于 {self._format_time(float(status['generated_at']))}）"
             )
+            if status.get("archetype"):
+                lines.append(f"  日型：{status['archetype']}")
             if status["persona_name"]:
                 kind = (
                     "扮演角色"
@@ -170,6 +186,8 @@ class ScheduleCommand(BaseCommand):
 
         if status["generating"]:
             lines.append("  正在后台生成……")
+        if status.get("refreshing_pool"):
+            lines.append("  正在后台编日程池……")
         if status["last_error"]:
             lines.append(f"  上次生成失败：{status['last_error']}")
 
@@ -216,6 +234,68 @@ class ScheduleCommand(BaseCommand):
             return True, "busy"
 
         await self._reply("好，我去重新安排一下今天……生成完就能用。")
+        return True, "ok"
+
+    @cmd_route("pool")
+    async def handle_pool(self) -> tuple[bool, str]:
+        """查看日程池：有哪些日型、变体多少、什么时候到期。"""
+        service = await self._require_service()
+        if service is None:
+            return False, "service unavailable"
+
+        lines = ["【日程池】"]
+        lines.extend(await service.pool_lines())
+        await self._reply("\n".join(lines))
+        return True, "ok"
+
+    @cmd_route("refresh-pool")
+    async def handle_refresh_pool(self) -> tuple[bool, str]:
+        """重编日程池（后台执行，每个日型一次模型调用，要几分钟）。"""
+        service = await self._require_service()
+        if service is None:
+            return False, "service unavailable"
+
+        if service.mode() != "pool":
+            await self._reply("当前是 daily 模式（每天生成一份），没有池子可刷。")
+            return True, "skipped"
+
+        if not service.request_pool_refresh(force=True):
+            await self._reply("已经有一次刷池在进行，等它编完再看。")
+            return True, "busy"
+
+        await self._reply(
+            "好，我去把接下来这套日子重编一遍……\n"
+            "编好的日型会先存着，全部编够才换上去（期间今天照常用旧的）。"
+        )
+        return True, "ok"
+
+    @cmd_route("plans")
+    async def handle_plans(self) -> tuple[bool, str]:
+        """查看三层规划：年程 / 月程 / 周程。"""
+        service = await self._require_service()
+        if service is None:
+            return False, "service unavailable"
+
+        lines = ["【年程 / 月程 / 周程】"]
+        lines.extend(await service.plan_lines())
+        await self._reply("\n".join(lines))
+        return True, "ok"
+
+    @cmd_route("replan")
+    async def handle_replan(self) -> tuple[bool, str]:
+        """强制重新生成三层规划（后台执行）。"""
+        service = await self._require_service()
+        if service is None:
+            return False, "service unavailable"
+
+        if not service.request_planning(force=True):
+            await self._reply("已经有一次规划在跑（或规划层被关掉了），等它跑完再看。")
+            return True, "busy"
+
+        await self._reply(
+            "好，我把年、月、这一周都重新想一遍……\n"
+            "（池子模式下多数时候是抽模板，不花额外调用）"
+        )
         return True, "ok"
 
     @cmd_route("persona")
@@ -315,9 +395,10 @@ class ScheduleCommand(BaseCommand):
         if not getattr(service.config.offline, "enabled", False):
             await self._reply(
                 "离线生活还没开启。\n"
-                "在 config/plugins/daily_schedule/config.toml 的 [offline] 里把 enabled "
-                "设为 true，重启之后它就会把不在线的那段时间记下来。\n"
-                "（需要 time_sense 插件配合）"
+                "装了 time_sense 的话，插件加载时会自动把它打开——"
+                "重启一次再试；也可以用 /日程 查看 确认一下 time_sense 在不在。\n"
+                "都没有的话，在 config/plugins/daily_schedule/config.toml 的 [offline] "
+                "里把 enabled 设为 true。"
             )
             return True, "disabled"
 
@@ -365,6 +446,26 @@ class ScheduleCommand(BaseCommand):
     async def handle_persona_cn(self) -> tuple[bool, str]:
         """查看人设判定（中文别名）。"""
         return await self.handle_persona()
+
+    @cmd_route("池")
+    async def handle_pool_cn(self) -> tuple[bool, str]:
+        """查看日程池（中文别名）。"""
+        return await self.handle_pool()
+
+    @cmd_route("规划")
+    async def handle_plans_cn(self) -> tuple[bool, str]:
+        """查看三层规划（中文别名）。"""
+        return await self.handle_plans()
+
+    @cmd_route("重规划")
+    async def handle_replan_cn(self) -> tuple[bool, str]:
+        """重新生成三层规划（中文别名）。"""
+        return await self.handle_replan()
+
+    @cmd_route("刷池")
+    async def handle_refresh_pool_cn(self) -> tuple[bool, str]:
+        """重编日程池（中文别名）。"""
+        return await self.handle_refresh_pool()
 
     @cmd_route("让位")
     async def handle_yield_cn(self) -> tuple[bool, str]:

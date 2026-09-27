@@ -74,8 +74,13 @@ class DailyScheduleConfig(BaseConfig):
             description="生成日程的温度。判断人设类型时内部会另行压低温度。",
         )
         max_tokens: int = Field(
-            default=2000,
-            description="单次生成的输出上限。日程条目越多、越详细，需要留的余量越大。",
+            default=4000,
+            description=(
+                "单次生成的输出上限。日程条目越多、越详细，需要留的余量越大。\n"
+                "注意：task_name（默认 actor）若指向**思考模型**，思考链会先吃掉这份预算，\n"
+                "给低了会表现为「空返回」或 JSON 被截断（日志里的 empty response / 无法解析 JSON）\n"
+                "——那不是模型写得短，而是正文没输出。这种情况下按模型池里最贵的那档配。"
+            ),
         )
 
     @config_section("source")
@@ -141,6 +146,19 @@ class DailyScheduleConfig(BaseConfig):
     class ScheduleSection(SectionBase):
         """日程生成策略。"""
 
+        mode: str = Field(
+            default="pool",
+            description=(
+                "日程从哪来，两种模式：\n"
+                "pool（默认）：**日程池**——每隔 pool.refresh_days 天编几套「日型」"
+                "（每种日子一整套骨架 + 每段多个变体），每天从中**抽**一套。\n"
+                "  变化来自轮换、连续性来自日记与真实过过的日程，而且每日抽取不花模型调用。\n"
+                "daily：老模式——每天让模型把今天写一遍（已加「别照抄昨天骨架」的约束，\n"
+                "  但连续几天的重样仍比 pool 明显）。\n"
+                "pool 不可用（还没编好/编坏了/过期）时会自动回退到 daily 生成一份，"
+                "保证今天一定有日程。"
+            ),
+        )
         prewarm_time: str = Field(
             default="00:05",
             description=(
@@ -181,6 +199,166 @@ class DailyScheduleConfig(BaseConfig):
         max_entries: int = Field(
             default=14,
             description="日程条目数上限，超出部分会被截断。",
+        )
+
+    @config_section("pool")
+    class PoolSection(SectionBase):
+        """日程池配置（``schedule.mode = "pool"`` 时生效）。
+
+        池子 = 几套「日型」，每套是一整天的骨架，每个时段带若干变体；
+        每天从中抽一套（不调模型），每隔 ``refresh_days`` 天重编一次。
+
+        为什么默认这么设：日型数×变体数决定"多久不重样"（3 套 × 3 变体 ≈ 一周内
+        看不出循环）；每次只编一个日型（输出小、不容易被截断），编好一个存一个，
+        整池达标才替换——**池子一次写坏就是坏一整周，所以这里比单次生成多设了几道闸**。
+        """
+
+        refresh_days: int = Field(
+            default=7,
+            description=(
+                "池子有效期（天）。到期后重新编一套。\n"
+                "按周（7）最划算：刚好把日型走完一轮；填 30 意味着要准备一个月的量，\n"
+                "日型数与变体数都得加大，否则一个月内会明显看出重复。"
+            ),
+        )
+        archetypes: int = Field(
+            default=3,
+            description=(
+                "要编几套**工作日**日型（1-6）。\n"
+                "3 套 ≈ 一周里工作日基本不撞同一套（抽取会优先用最久没用的）。\n"
+                "每套是一次模型调用，所以这个数字同时决定刷池成本。"
+            ),
+        )
+        weekend_archetypes: int = Field(
+            default=2,
+            description=(
+                "要编几套**休息日**日型（0-4）。\n"
+                "0 表示不区分工作日与周末（周末会退回用工作日日型，容易看出来，不推荐）。"
+            ),
+        )
+        variants_per_slot: int = Field(
+            default=3,
+            description=(
+                "每个时段编几个变体（2-4）。\n"
+                "变体必须「场景一致、动作不同」——同一个时段同一套日型下，\n"
+                "换的是具体在做的事，不是换措辞。变体越多，同一套日型连续用两天也不重样。"
+            ),
+        )
+        retry_times: int = Field(
+            default=2,
+            description=(
+                "单个日型生成不合格时的重试次数（会把问题反馈给模型再要一次）。\n"
+                "重试只在**编池子**时发生，不影响对话。"
+            ),
+        )
+        min_archetypes: int = Field(
+            default=2,
+            description=(
+                "工作日日型少到这个数以下，就判定整池不达标、不替换旧池子。\n"
+                "默认 2：池子刚装好正在编的时候，宁可继续用旧池子/回退 daily，\n"
+                "也不要把只有一套日型的池子换上去（那等于每天都一样）。"
+            ),
+        )
+        avoid_recent_days: int = Field(
+            default=7,
+            description=(
+                "抽取时回顾最近几天的日程，用来避开刚用过的日型、也避开昨天同一时段的同一句话。"
+            ),
+        )
+        max_tokens: int = Field(
+            default=4000,
+            description=(
+                "编**一个日型**时的输出上限。\n"
+                "一个日型 ≈ 13 段 × 3 变体，正文约 1200-2000 token；\n"
+                "actor 若是思考模型，思考链会先吃掉预算，这种情况按 8000 配。"
+            ),
+        )
+        fallback_to_daily: bool = Field(
+            default=True,
+            description=(
+                "池子不可用（还没编好 / 编坏了 / 过期 / 抽不出来）时，是否回退到 daily 模式\n"
+                "现生成一份今天的日程。\n"
+                "默认 true——宁可这一次多花一次模型调用，也不能让今天没有日程。"
+            ),
+        )
+
+    @config_section("plan")
+    class PlanSection(SectionBase):
+        """三层规划：年程 → 月程 → 周程（日程层在 [schedule] / [pool]）。
+
+        每层围绕上一层生成，**变化程度逐层放大**：年程最稳（一年一个走向）、
+        月程分忙碌 / 休息（学期月 vs 寒暑假月）、周程定义日程该干什么、
+        日程最活（每天不重样）。
+
+        每层都有两种模式：
+
+        - ``pool``（默认）：编几套**型**（"这类时期通常怎么过"的模板），到期抽一套，
+          再用上层目标规则化填充——抽取与填充都不调模型。
+        - ``direct``：到期现场生成一份（每次一次调用，更贴合当下）。
+        """
+
+        enabled: bool = Field(
+            default=True,
+            description="是否启用三层规划。关掉后日程层照常工作，只是不再有年月周的依据。",
+        )
+        year_mode: str = Field(
+            default="pool",
+            description="年程模式：pool / direct。年层一次调用本来就不贵，想更贴合当下可以改 direct。",
+        )
+        month_mode: str = Field(
+            default="pool",
+            description="月程模式：pool / direct。",
+        )
+        week_mode: str = Field(
+            default="pool",
+            description=(
+                "周程模式：pool / direct。\n"
+                "周程是「定义日程该干什么」的那一层，也是被日程层每周期消费的东西，\n"
+                "默认走池子（抽模板 + 上层填充，不额外花调用）。"
+            ),
+        )
+        refresh_days_year: int = Field(
+            default=180,
+            description="年程型池的有效期（天）。",
+        )
+        refresh_days_month: int = Field(
+            default=60,
+            description="月程型池的有效期（天）。",
+        )
+        refresh_days_week: int = Field(
+            default=21,
+            description="周程型池的有效期（天）。",
+        )
+        min_items: int = Field(
+            default=1,
+            description="每层至少要有几条推进项，少于这个数视为生成失败。",
+        )
+        retry_times: int = Field(
+            default=2,
+            description="某一层编型不合格时的重试次数（会把问题反馈给模型）。",
+        )
+        max_tokens: int = Field(
+            default=1200,
+            description=(
+                "生成一层规划的**单次**输出上限。\n"
+                "一层规划只有几句话几条事项，1200 富余；\n"
+                "actor 若是思考模型就把思考链的余量加进去（按 3000 配）。"
+            ),
+        )
+        feed_schedule: bool = Field(
+            default=True,
+            description=(
+                "是否把这些规划喂给日程层（生成日型、写日记时当材料，抽取时按周程挑日型）。\n"
+                "关掉就退回「只看人设与记忆」的老行为。"
+            ),
+        )
+        inject_in_chat: bool = Field(
+            default=False,
+            description=(
+                "是否把周程也注入对话（每轮一段「这周在推进什么」）。\n"
+                "**默认关**：规划只在生成侧起作用，不占每轮 token；\n"
+                "开启后每轮多几十字，好处是她能直接聊起「这周在忙什么」。"
+            ),
         )
 
     @config_section("scene")
@@ -238,6 +416,26 @@ class DailyScheduleConfig(BaseConfig):
             default="（{hint}）",
             description="日程条目自带反应倾向时的附加模板，留空表示不附加。",
         )
+        hint_only_when_busy: bool = Field(
+            default=True,
+            description=(
+                "反应倾向是否**只在忙的时候**附加。\n"
+                "默认 true：闲着的时段场景行就只剩「你此刻正在：……」一句，\n"
+                "省 token 也少一层噪音（闲时本来就不需要「可以搭话」这种说明）。"
+            ),
+        )
+        channel: str = Field(
+            default="reminder_first",
+            description=(
+                "注入走哪条路：reminder_first（默认）/ both / extra_only。\n"
+                "reminder_first：优先写 system reminder；写成功就不再往 user prompt 的\n"
+                "  ``extra`` 里追加——**同一段背景在同一个请求里出现两遍**只是把 token 付两遍，\n"
+                "  还会让模型更注意到它。写失败（或关掉 reminder_enabled）才退回 extra。\n"
+                "both：两条路都写（旧行为）。只有当你的 chatter **不拾取** with_reminder 时\n"
+                "  才需要它——DFC / NDFC 都会拾取，所以默认不是 both。\n"
+                "extra_only：只走 extra，完全不碰 reminder。"
+            ),
+        )
         note: str = Field(
             default=(
                 "（以上只是你此刻的状态背景，不是要你念出来的台词："
@@ -288,6 +486,18 @@ class DailyScheduleConfig(BaseConfig):
                 "{master} 主人称呼。\n"
                 "让位心声由生成日程时的模型一并产出，语气是「为了你而放下」，"
                 "而不是「规则要求我让出时间」。"
+            ),
+        )
+        yield_stream_scope: bool = Field(
+            default=True,
+            description=(
+                "让位是否**只在触发它的那个会话**生效。\n"
+                "开启（默认）时：日程行照旧全局注入，让位心声改为写进该会话的\n"
+                "**流私有 reminder**（prompt_api.add_stream_reminder），别的群/私聊不受影响；\n"
+                "同时让位期间不再追加 busy_suffix，免得「我手上正忙」和「这些先放一放」\n"
+                "两句话同时进上下文。\n"
+                "关闭则退回旧行为：让位心声替换场景行、写进全局 bucket\n"
+                "（主人在任意一个会话开口，所有会话都会看到这句话）。"
             ),
         )
 
@@ -384,21 +594,57 @@ class DailyScheduleConfig(BaseConfig):
             description="日记保留天数，超出即回收；设为 0 表示永久保留。",
         )
         inject_enabled: bool = Field(
-            default=False,
+            default=True,
             description=(
                 "是否把最近的日记注入对话提示词。\n"
-                "开启后主模型才知道「它不在的时候做了什么」，被问起时不会前后矛盾。"
+                "开启后主模型才知道「它不在的时候做了什么」，被问起时不会前后矛盾；\n"
+                "不开启的话日记只躺在盘上，问起来照样只能现编——那就白写了。\n"
+                "担心 token 就把 inject_max_chars 调小或 inject_days 设 0。"
             ),
         )
         inject_days: int = Field(
             default=1,
             description="注入最近几天的日记（1 表示只给最近一篇）。",
         )
+        inject_max_chars: int = Field(
+            default=600,
+            description=(
+                "注入日记的字符上限，超出即截断。\n"
+                "设为 0 表示不截断。"
+            ),
+        )
+        inject_turns: int = Field(
+            default=3,
+            description=(
+                "每次记完日记之后，**只在接下来的几轮对话里**注入它（默认 3 轮）。\n"
+                "实测量过：日记注入块约 400 字，是「每轮注入」里最大的那一份（占 82%）。\n"
+                "每轮都发等于按请求数重复付费，而它要传达的信息（「它不在的时候做了什么」）\n"
+                "只需要被模型知道一次——之后历史里已经有了。\n"
+                "填 0 表示每轮都注入（旧行为），只在你确实希望它一直挂在上下文里时才这么设。"
+            ),
+        )
+        roll_enabled: bool = Field(
+            default=True,
+            description=(
+                "离线回来时，是否对「这周 / 这月正在推进的事」做一次随机评估。\n"
+                "结果会写进日记（这一次是顺利还是卡住了），并成为情绪与后续安排的材料。\n"
+                "同一条推进项只评估一次（结果落盘），重启不会重掷，人设不会自相矛盾。"
+            ),
+        )
+        roll_success_rate: float = Field(
+            default=0.8,
+            description=(
+                "随机评估的**成功概率**：默认 0.8 ＝ 八成顺利（它高兴）、两成不顺利（它失落）。\n"
+                "取值 0-1，0.5 就一半一半。"
+            ),
+        )
 
     plugin: PluginSection = Field(default_factory=PluginSection)
     model: ModelSection = Field(default_factory=ModelSection)
     source: SourceSection = Field(default_factory=SourceSection)
     schedule: ScheduleSection = Field(default_factory=ScheduleSection)
+    pool: PoolSection = Field(default_factory=PoolSection)
+    plan: PlanSection = Field(default_factory=PlanSection)
     scene: SceneSection = Field(default_factory=SceneSection)
     log: LogSection = Field(default_factory=LogSection)
     offline: OfflineSection = Field(default_factory=OfflineSection)

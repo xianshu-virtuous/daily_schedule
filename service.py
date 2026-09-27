@@ -3,7 +3,7 @@
 对外的唯一入口，承担：
 
 - 读取（必要时后台生成）当天日程；
-- 装配注入文本供事件处理器使用；
+- 装配注入文本供事件处理器使用（拆成全局段与本流让位段）；
 - 处理「主人到场」的让位状态；
 - 供 ``/日程`` 命令查询与手动重生成。
 
@@ -20,6 +20,9 @@
 离线跨度，结合当天日程与记忆服务缝成第一人称的日记，按天合并存盘，
 见 :mod:`diary`。
 
+日程来源有两种模式（``schedule.mode``）：``pool`` 从日程池抽取（默认，
+见 :mod:`pool`），``daily`` 每天让模型写一份。池子不可用时回退到 daily。
+
 注意：框架的 ``service_api.get_service()`` 每次调用都会 **新建** 一个服务实例
 （非单例）。所以跨调用者共享的东西只能放两处——要么落在类属性上（进程内共享），
 要么落盘到 ``store``（跨进程、跨重启共享）。日程、日志、让位状态都在盘上；
@@ -30,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -39,7 +43,7 @@ from src.app.plugin_system.base import BaseService
 from src.app.plugin_system.types import PermissionLevel
 from src.kernel.concurrency import get_task_manager
 
-from . import diary, generator, scene, store
+from . import diary, generator, plan as plan_module, pool as pool_module, scene, store
 from .config import DailyScheduleConfig
 from .models import BUSY_LABELS, DailySchedule, RuntimeState
 from .persona import read_persona
@@ -57,6 +61,12 @@ _PREWARM_TICK_SECONDS = 1800
 #: 「正在生成」标记的有效期（秒）。超过这个时长仍为生成中，视作上一次任务
 #: 异常中断留下的残标，允许重新抢占，避免生成能力被永久锁死。
 _GENERATION_STALE_SECONDS = 900
+
+#: 日程来源模式：日程池（池子抽取，默认）。
+_MODE_POOL = "pool"
+
+#: 日程来源模式：每天让模型生成一份（老模式，已加防重复约束）。
+_MODE_DAILY = "daily"
 
 #: time_sense 服务签名。日程的时间一律以它为准——它是本进程里「真实时间」的
 #: 唯一权威，还负责在启动时结算离线跨度。两处各算一次时间，迟早会对不上。
@@ -78,6 +88,26 @@ _OFFLINE_BOOT_WAIT_SECONDS = 120.0
 _TABLE_TIME_WIDTH = 15
 _TABLE_BUSY_WIDTH = 6
 _TABLE_DOING_WIDTH = 60
+
+
+@dataclass
+class SceneTexts:
+    """一次注入装配的结果：全局段 + 本流让位段。
+
+    Attributes:
+        base: 写全局 reminder / 兜底 extra 的文本（不含让位心声）。
+        stream: 只写给触发让位那个会话的让位行；不需要时为空。
+    """
+
+    base: str = ""
+    stream: str = ""
+
+    @property
+    def full(self) -> str:
+        """合并形态（兼容只认一份文本的调用方）。"""
+        if self.base and self.stream:
+            return f"{self.base}\n{self.stream}"
+        return self.base or self.stream
 
 
 def _required_level(text: str) -> PermissionLevel:
@@ -105,6 +135,7 @@ class ScheduleService(BaseService):
 
     - ``get_schedule``：取某天日程（不触发生成）
     - ``get_injection``：取当前应注入的场景文本（可能顺手排队一次后台生成）
+    - ``injection_texts``：同上，但拆成「全局段 + 本流让位段」，供按流注入使用
     - ``regenerate``：强制重新生成
     - ``mark_yield``：主人到场，把日程时间让出来
     - ``status``：状态摘要（命令与排查用）
@@ -117,6 +148,16 @@ class ScheduleService(BaseService):
     #: 所以这里的互斥必须挂在类上，实例属性起不到任何作用。
     _generating: bool = False
     _generating_since: float = 0.0
+
+    #: 刷池中的闸门（同样必须是类属性）。刷池要跑好几次模型调用，
+    #: 比生成一份日程慢得多，所以它与生成闸门分开：抽取（快、不调模型）
+    #: 不该被刷池挡住。
+    _refreshing_pool: bool = False
+    _refreshing_since: float = 0.0
+
+    #: 规划层的闸门：年 / 月 / 周程的生成也要走后台（可能连着几次调用）。
+    _planning: bool = False
+    _planning_since: float = 0.0
 
     def __init__(self, plugin: Any) -> None:
         """初始化服务。
@@ -324,8 +365,43 @@ class ScheduleService(BaseService):
 
         result["span"] = span
 
+        # 随机评估：离线回来时，对「这周 / 这月正在推进的事」掷一次骰
+        # （八成顺利、两成卡住）。结果落盘进计划文件，所以同一条不会重掷。
+        moment_now = await self.current_time()
+        plan_text = await self._plan_block(moment_now)
+        outcome_lines = ""
+        outcome_items: list[str] = []
         try:
-            entry = await diary.record_offline(config, span)
+            state = await store.load_state()
+            today = moment_now.date().isoformat()
+            if getattr(state, "last_roll_date", "") == today:
+                logger.debug("[daily_schedule] 今天已经评估过了，跳过随机评估")
+            else:
+                plans = await plan_module.load_current_chain(moment_now)
+                outcomes = plan_module.roll_progress(
+                    self.config, plans, moment=moment_now
+                )
+                if outcomes:
+                    await plan_module.advance_progress(plans, outcomes)
+                    outcome_lines = plan_module.outcome_block(outcomes)
+                    outcome_items = [
+                        f"{item.text}：{'顺利' if progress == 'ok' else '卡住了'}"
+                        for item, progress in outcomes
+                    ]
+                    state.last_roll_date = today
+                    await store.save_state(state)
+                    logger.info("[daily_schedule] 随机评估：" + "；".join(outcome_items))
+        except Exception as error:  # noqa: BLE001 - 评估失败不该影响日记
+            logger.warning(f"[daily_schedule] 随机评估失败: {error}")
+
+        try:
+            entry = await diary.record_offline(
+                config,
+                span,
+                plan_block=plan_text,
+                outcome_lines=outcome_lines,
+                outcomes=outcome_items,
+            )
         except Exception as error:  # noqa: BLE001 - 日记失败不该影响启动
             result["reason"] = f"记录日记失败: {error}"
             logger.warning(f"[daily_schedule] 记录离线日记失败: {error}")
@@ -351,10 +427,15 @@ class ScheduleService(BaseService):
         return await diary.recent_days(limit)
 
     async def diary_injection(self) -> str:
-        """取要注入对话的日记文本。
+        """取要注入对话的日记文本（**限次**，不是每轮都发）。
 
         只有 ``offline.enabled`` 与 ``offline.inject_enabled`` 同时开启时才有内容：
         主模型得先知道「它不在的时候做了什么」，被问起时才不会前后矛盾。
+
+        但实测这块约 400 字，是每轮注入里最大的那一份（占 82%）。每轮都发等于按请求数
+        重复付费，而它要传达的信息只需要被模型知道一次——之后对话历史里已经有了。
+        所以按 ``offline.inject_turns`` 限次：每次记完日记，计数器置为该值，
+        每注入一次减一，减到 0 就不再发（填 0 表示退回"每轮都发"的旧行为）。
 
         Returns:
             注入文本；不需要注入时返回空字符串。
@@ -365,11 +446,29 @@ class ScheduleService(BaseService):
         if not getattr(config.offline, "inject_enabled", False):
             return ""
 
+        turns = max(0, int(getattr(config.offline, "inject_turns", 3)))
+        state = None
+        if turns > 0:
+            state = await store.load_state()
+            if state.diary_inject_left <= 0:
+                return ""
+
         days = await diary.recent_days(max(1, int(config.offline.inject_days)))
         blocks = [day.text_block() for day in days if not day.is_empty]
         if not blocks:
             return ""
-        return "【它不在线的时候（真实发生过的，可自然提起）】\n" + "\n\n".join(blocks)
+        block = "【它不在线的时候（真实发生过的，可自然提起）】\n" + "\n\n".join(blocks)
+
+        limit = max(0, int(getattr(config.offline, "inject_max_chars", 600)))
+        if limit and len(block) > limit:
+            block = block[:limit].rstrip() + "…"
+
+        if state is not None:
+            # 这一次算用掉一轮：写回计数器，用完就不再打扰上下文
+            state.diary_inject_left = max(0, state.diary_inject_left - 1)
+            await store.save_state(state)
+
+        return block
 
     async def get_schedule(
         self, day: str | None = None, *, now: datetime | None = None
@@ -438,8 +537,338 @@ class ScheduleService(BaseService):
         cls._generating = False
         cls._generating_since = 0.0
 
-    async def _generate(self, moment: datetime) -> DailySchedule | None:
-        """真正去生成当天日程（调用方需已持有生成闸门）。
+    @classmethod
+    def is_refreshing_pool(cls) -> bool:
+        """当前是否有一次刷池正在进行（进程内）。"""
+        if not cls._refreshing_pool:
+            return False
+        if time.time() - cls._refreshing_since >= _GENERATION_STALE_SECONDS:
+            return False
+        return True
+
+    @classmethod
+    def _claim_pool_refresh(cls) -> bool:
+        """抢占刷池闸门。"""
+        if cls.is_refreshing_pool():
+            return False
+        cls._refreshing_pool = True
+        cls._refreshing_since = time.time()
+        return True
+
+    @classmethod
+    def _release_pool_refresh(cls) -> None:
+        """释放刷池闸门。"""
+        cls._refreshing_pool = False
+        cls._refreshing_since = 0.0
+
+    @classmethod
+    def is_planning(cls) -> bool:
+        """当前是否在生成规划（年 / 月 / 周程）。"""
+        if not cls._planning:
+            return False
+        if time.time() - cls._planning_since >= _GENERATION_STALE_SECONDS:
+            return False
+        return True
+
+    @classmethod
+    def _claim_planning(cls) -> bool:
+        """抢占规划闸门。"""
+        if cls.is_planning():
+            return False
+        cls._planning = True
+        cls._planning_since = time.time()
+        return True
+
+    @classmethod
+    def _release_planning(cls) -> None:
+        """释放规划闸门。"""
+        cls._planning = False
+        cls._planning_since = 0.0
+
+    # ── 三层规划（年 / 月 / 周程） ────────────────────────────────────────────
+
+    async def current_plans(
+        self, moment: datetime | None = None
+    ) -> dict[str, Any]:
+        """只读地取当前三层规划（不触发生成）。"""
+        return await plan_module.load_current_chain(moment)
+
+    async def _plan_block(self, moment: datetime) -> str:
+        """取喂给日程层 / 日记层的规划文本（配置关掉时为空）。"""
+        if not bool(getattr(self.config.plan, "feed_schedule", True)):
+            return ""
+        return plan_module.plan_block(await plan_module.load_current_chain(moment))
+
+    def request_planning(self, *, force: bool = False) -> bool:
+        """把「补齐三层规划」排进后台。
+
+        规划最长要跑三次调用（年 / 月 / 周各一次），绝不能卡在对话链路或启动报告上；
+        池子模式下如果型池已就绪，多数时候是零调用的。
+
+        Args:
+            force: 是否强制重生成三层（``/日程 规划 重生成`` 用）。
+
+        Returns:
+            是否成功排队（已有一次在跑时返回 ``False``）。
+        """
+        if not bool(getattr(self.config.plan, "enabled", True)):
+            return False
+        if not self._claim_planning():
+            return False
+
+        async def _job() -> None:
+            try:
+                moment = await self.current_time()
+                await plan_module.ensure_chain(
+                    self.config, self.plugin, now=moment, force=force
+                )
+                # 规划一变，今天的日程也该跟着重排一次（抽取不花钱）
+                if self.mode() == _MODE_POOL:
+                    existing = await store.load_schedule(moment.date().isoformat())
+                    if existing is not None and not existing.is_empty:
+                        await self._compose_from_pool(moment, force=True)
+            except Exception as error:  # noqa: BLE001 - 规划失败不影响对话
+                logger.warning(f"[daily_schedule] 生成规划失败: {error}")
+            finally:
+                self._release_planning()
+
+        try:
+            get_task_manager().create_task(
+                _job(), name="daily_schedule.planning", group_name="daily_schedule"
+            )
+        except Exception as error:  # noqa: BLE001 - 排队失败按未排队处理
+            logger.warning(f"[daily_schedule] 排队规划任务失败: {error}")
+            self._release_planning()
+            return False
+        return True
+
+    async def _ensure_plans(self, moment: datetime) -> bool:
+        """三层规划有缺失或过期就排一次后台补齐。
+
+        Returns:
+            三层都齐（有效期内）返回 True。
+        """
+        if not bool(getattr(self.config.plan, "enabled", True)):
+            return True
+        plans = await plan_module.load_current_chain(moment)
+        stale = [
+            name
+            for name, item in plans.items()
+            if item is None or item.is_expired(moment.timestamp())
+        ]
+        if not stale:
+            return True
+        logger.info(
+            "[daily_schedule] 规划需要补齐："
+            + "、".join(
+                plan_module.PLAN_LAYER_LABELS.get(name, name) for name in stale
+            )
+        )
+        self.request_planning()
+        return False
+
+    # ── 模式 ──────────────────────────────────────────────────────────────────
+
+    def mode(self) -> str:
+        """当前日程来源模式（``pool`` / ``daily``）。
+
+        配置写错时按 ``pool`` 处理，并在日志里说一次——池子有 daily 回退，
+        所以往池子这边靠是更安全的一侧。
+
+        Returns:
+            模式字符串。
+        """
+        raw = str(getattr(self.config.schedule, "mode", _MODE_POOL) or "").strip().lower()
+        if raw not in (_MODE_POOL, _MODE_DAILY):
+            logger.warning(
+                f"[daily_schedule] schedule.mode 配置非法: {raw!r}，按 {_MODE_POOL} 处理"
+            )
+            return _MODE_POOL
+        return raw
+
+    async def _compose_from_pool(
+        self, moment: datetime, *, force: bool = False
+    ) -> DailySchedule | None:
+        """从池子里抽一套今天的日程（不调用模型）。
+
+        Args:
+            moment: 参考时间。
+            force: 是否换一套（``/日程 重生成`` 用：避开今天已经抽过的日型）。
+
+        Returns:
+            抽取出的日程并已落盘；池子不可用时返回 ``None``。
+        """
+        pool = await store.load_pool()
+        snapshot = read_persona()
+        fingerprint = snapshot.fingerprint if snapshot is not None else ""
+
+        if not pool_module.pool_is_usable(
+            pool, fingerprint=fingerprint, now_ts=moment.timestamp()
+        ):
+            if pool is not None:
+                if pool.is_expired(moment.timestamp()):
+                    logger.info("[daily_schedule] 池子已过期，需要重刷")
+                elif fingerprint and pool.persona_fingerprint != fingerprint:
+                    logger.info("[daily_schedule] 人设变了，池子需要重刷")
+            return None
+
+        assert pool is not None  # pool_is_usable 已保证
+        recent = await store.recent_schedules(
+            max(1, int(getattr(self.config.pool, "avoid_recent_days", 7)))
+        )
+
+        exclude: list[str] = []
+        if force:
+            for item in recent:
+                if item.date == moment.date().isoformat() and item.archetype:
+                    exclude.append(item.archetype)
+
+        # 周程给今天的重点：命中日型标签就优先用它（字符串匹配，不花调用）
+        focus_text = ""
+        if bool(getattr(self.config.plan, "feed_schedule", True)):
+            plans = await plan_module.load_current_chain(moment)
+            focus = plan_module.today_focus(plans, moment)
+            if focus is not None:
+                focus_text = focus.text
+                logger.debug(f"[daily_schedule] 周程今天偏重：{focus.text}")
+
+        schedule = pool_module.compose_day(
+            pool,
+            moment=moment,
+            recent=recent,
+            exclude_keys=exclude,
+            focus_text=focus_text,
+        )
+        if schedule is None:
+            logger.warning("[daily_schedule] 池子里没有可用日型，抽不出今天的日程")
+            return None
+
+        await store.save_schedule(schedule)
+        await generator.record_schedule_log(
+            schedule, log_enabled=bool(self.config.log.enabled)
+        )
+        logger.info(
+            f"[daily_schedule] 已从池子抽取 {schedule.date} 日程："
+            f"日型 {schedule.archetype}（{len(schedule.entries)} 段）"
+        )
+        return schedule
+
+    def request_pool_refresh(self, *, force: bool = False) -> bool:
+        """把一次刷池排进后台，立刻返回。
+
+        刷池要跑好几分钟（每个日型一次模型调用），绝不能卡在对话链路上；
+        编好一个日型就落盘一次，所以中途重启不会白编。
+
+        Args:
+            force: 是否无视现有池子直接重编（``/日程 刷池`` 用）。
+
+        Returns:
+            是否成功排队（已有刷池在跑时返回 ``False``）。
+        """
+        if self.mode() != _MODE_POOL:
+            return False
+        if not self._claim_pool_refresh():
+            logger.info("[daily_schedule] 已有一次刷池在进行，跳过这次请求")
+            return False
+
+        async def _job() -> None:
+            try:
+                moment = await self.current_time()
+                plan_text = await self._plan_block(moment)
+                pool = await pool_module.refresh_pool(
+                    self.config,
+                    self.plugin,
+                    now=moment,
+                    force=force,
+                    plan_block=plan_text,
+                )
+                if pool is None:
+                    return
+                # 刷完顺手看一眼今天有没有日程：刚装好的那天正好补上
+                existing = await store.load_schedule(moment.date().isoformat())
+                if existing is None or existing.is_empty:
+                    await self.ensure_today(now=moment)
+            except Exception as error:  # noqa: BLE001 - 刷池失败不影响对话
+                logger.warning(f"[daily_schedule] 刷池失败: {error}")
+            finally:
+                self._release_pool_refresh()
+
+        try:
+            get_task_manager().create_task(
+                _job(), name="daily_schedule.refresh_pool", group_name="daily_schedule"
+            )
+        except Exception as error:  # noqa: BLE001 - 排队失败按未排队处理
+            logger.warning(f"[daily_schedule] 排队刷池任务失败: {error}")
+            self._release_pool_refresh()
+            return False
+        return True
+
+    async def _ensure_pool_fresh(self, moment: datetime) -> bool:
+        """池子失效就排一次刷池（巡检与启动都会调）。
+
+        Args:
+            moment: 参考时间。
+
+        Returns:
+            池子当前可用返回 True；需要刷池（已排队）返回 False。
+        """
+        if self.mode() != _MODE_POOL:
+            return True
+
+        pool = await store.load_pool()
+        snapshot = read_persona()
+        fingerprint = snapshot.fingerprint if snapshot is not None else ""
+        if pool_module.pool_is_usable(
+            pool, fingerprint=fingerprint, now_ts=moment.timestamp()
+        ):
+            return True
+
+        if pool is None:
+            reason = "还没有池子"
+        elif pool.is_expired(moment.timestamp()):
+            reason = "池子已过期"
+        elif fingerprint and pool.persona_fingerprint != fingerprint:
+            reason = "人设变了"
+        else:
+            reason = "池子不可用"
+        logger.info(f"[daily_schedule] {reason}，排队刷池")
+        self.request_pool_refresh()
+        return False
+
+    async def _generate(
+        self, moment: datetime, *, force: bool = False
+    ) -> DailySchedule | None:
+        """按模式产出当天日程（调用方需已持有生成闸门）。
+
+        - ``pool``：先从池子抽（不调模型）；抽不出来就排一次刷池，并按配置回退 daily；
+        - ``daily``：直接让模型写一份（回喂里的「已用过」措辞已改成要求避开）。
+
+        Args:
+            moment: 参考时间。
+            force: 是否强制重来（池子模式下表示换一套日型）。
+
+        Returns:
+            生成的日程；失败返回 ``None``。
+        """
+        if self.mode() == _MODE_POOL:
+            schedule = await self._compose_from_pool(moment, force=force)
+            if schedule is not None:
+                await self.log_today(now=moment, prefix="抽取完成 · ")
+                return schedule
+
+            self.request_pool_refresh()
+            if not bool(getattr(self.config.pool, "fallback_to_daily", True)):
+                logger.warning(
+                    "[daily_schedule] 池子不可用，且 pool.fallback_to_daily 已关闭，"
+                    "今天没有日程（等池子编好即可）"
+                )
+                return None
+            logger.info("[daily_schedule] 池子不可用，回退到 daily 模式生成今天")
+
+        return await self._generate_daily(moment)
+
+    async def _generate_daily(self, moment: datetime) -> DailySchedule | None:
+        """每天让模型写一份日程（老模式，也是池子不可用时的兜底）。
 
         Args:
             moment: 参考时间。
@@ -455,7 +884,12 @@ class ScheduleService(BaseService):
 
             profile = await generator.ensure_persona_profile(self.config, snapshot)
             schedule = await generator.generate_daily_schedule(
-                self.config, self.plugin, snapshot, profile, now=moment
+                self.config,
+                self.plugin,
+                snapshot,
+                profile,
+                now=moment,
+                plan_block=await self._plan_block(moment),
             )
         except Exception as error:  # noqa: BLE001 - 生成失败不应中断对话
             logger.error(f"[daily_schedule] 日程生成异常: {error}")
@@ -583,6 +1017,12 @@ class ScheduleService(BaseService):
 
         moment = now or await self.current_time()
         day = moment.date().isoformat()
+
+        # 池子模式：启动时顺手看一眼池子在不在（首次安装就在这一刻开始编）
+        await self._ensure_pool_fresh(moment)
+        # 规划层：年 / 月 / 周程缺哪层补哪层（后台）
+        await self._ensure_plans(moment)
+
         schedule = await self.get_schedule(now=moment)
         if schedule is not None and schedule.date != day:
             schedule = None
@@ -637,7 +1077,7 @@ class ScheduleService(BaseService):
             return await store.load_schedule(day)
 
         try:
-            return await self._generate(moment)
+            return await self._generate(moment, force=force)
         finally:
             self._release_generation()
 
@@ -645,7 +1085,7 @@ class ScheduleService(BaseService):
         """把一次生成排进后台，立刻返回。
 
         Args:
-            force: 是否强制重新生成。
+            force: 是否强制重新生成（池子模式下表示换一套日型）。
 
         Returns:
             是否成功排队（已有生成在跑时返回 ``False``）。
@@ -656,7 +1096,7 @@ class ScheduleService(BaseService):
         async def _job() -> None:
             moment = await self.current_time()
             try:
-                await self._generate(moment)
+                await self._generate(moment, force=force)
             finally:
                 self._release_generation()
 
@@ -692,6 +1132,9 @@ class ScheduleService(BaseService):
     async def prewarm_tick(self) -> None:
         """预生成巡检：到点且当天还没有日程时生成一次。
 
+        池子模式下多一步：先看池子在不在有效期内，不在就排一次刷池；
+        今天还没日程就顺手抽一套（抽取不调模型，很快）。
+
         由统一调度器按固定间隔调用，因此进程重启后同样能自愈。
         """
         config = self.config
@@ -721,6 +1164,9 @@ class ScheduleService(BaseService):
             )
             return
 
+        await self._ensure_pool_fresh(moment)
+        await self._ensure_plans(moment)
+
         existing = await store.load_schedule(day)
         if not self._is_stale(existing, moment):
             logger.info(f"[daily_schedule] 巡检 · {day} 日程正常（{len(existing.entries)} 段）")
@@ -733,21 +1179,55 @@ class ScheduleService(BaseService):
 
     # ── 注入装配 ──────────────────────────────────────────────────────────────
 
-    async def get_injection(self, *, now: datetime | None = None) -> str:
-        """取当前应注入的场景文本。
+    async def get_injection(
+        self, *, now: datetime | None = None, stream_id: str | None = None
+    ) -> str:
+        """取当前应注入的场景文本（合并形态，兼容旧调用方）。
 
         当天日程缺失或过期时，只在允许按需生成的情况下排一次后台生成，
         本轮不注入（避免阻塞），下一轮自然生效。
 
         Args:
             now: 参考时间。
+            stream_id: 当前构建的这个会话；传了才能按流隔离让位。
 
         Returns:
             注入文本；无需注入时返回空字符串。
         """
+        texts = await self.injection_texts(now=now, stream_id=stream_id)
+        return texts.full
+
+    async def injection_texts(
+        self, *, now: datetime | None = None, stream_id: str | None = None
+    ) -> "SceneTexts":
+        """取当前应注入的场景文本，拆成「全局」与「本流让位」两段。
+
+        为什么要拆：日程是 Bot 自己的状态（所有会话一致，写全局 bucket），
+        而让位是「主人在**这个**会话开口」引起的——旧版把它也写进全局 bucket，
+        于是主人在 A 群说句话，B 群的场景行也会变成「我更想听你说」。
+
+        拆分规则（``scene.yield_stream_scope`` 打开时）：
+
+        - ``base``：不含让位心声的场景行 + 说明，写全局 bucket；
+        - ``stream``：让位行（不含说明），只写给 ``state.yield_stream_id`` 那个流。
+
+        让位期间还会顺手去掉 ``busy_suffix``（「手上正忙」与「这些先放一放」
+        不能同时进上下文）。关掉 ``yield_stream_scope`` 即退回旧行为：
+        让位行合并进 ``base``、写全局 bucket。
+
+        不知道 stream_id 的调用方（老 chatter）、盘上没记下触发流（旧版状态文件）、
+        或没开隔离时，拿到的仍是旧的合并形态——所以 ``get_injection()`` 的语义没有变化。
+
+        Args:
+            now: 参考时间。
+            stream_id: 当前构建的会话 ID，可为空。
+
+        Returns:
+            :class:`SceneTexts`；无需注入时两段都为空。
+        """
         config = self.config
         if not config.plugin.enabled or not config.scene.enabled:
-            return ""
+            return SceneTexts()
 
         moment = now or await self.current_time()
         schedule = await store.load_schedule(moment.date().isoformat())
@@ -762,17 +1242,53 @@ class ScheduleService(BaseService):
             if self.request_generation():
                 logger.info("[daily_schedule] 当天日程缺失或过期，已排队后台生成")
 
-        injection = scene.build_injection(config, schedule, state, moment)
+        scoped = bool(getattr(config.scene, "yield_stream_scope", True))
+        yielding = state.is_yielding(moment.timestamp())
+        stream_known = bool(str(stream_id or "").strip())
+        # 让位是谁引起的：老版本落盘的状态里没有这个字段，消息也可能不带 stream_id。
+        # 认不出「是哪个流」时不做隔离——宁可照旧全局注入，也别让它哪都不出现。
+        stored_stream = (state.yield_stream_id or "").strip()
+
+        # 让位心声进 base 的三种情况：没开流隔离（旧行为）、这次构建不知道是哪个流
+        # （老 chatter 不往 values 里塞 stream_id）、或盘上没记下触发流。
+        base_allows_yield = yielding and (not scoped or not stream_known or not stored_stream)
+
+        base = scene.build_injection(
+            config,
+            schedule,
+            state,
+            moment,
+            allow_yield=base_allows_yield,
+            busy_suffix=not (scoped and yielding),
+        )
+
+        stream_text = ""
+        if yielding and scoped and stream_known and stored_stream == str(stream_id).strip():
+            stream_text = scene.build_yield_line(config, schedule, state, moment)
 
         # 日记接在场景行之后：场景说明「此刻」，日记补上「它不在的时候」，
         # 两者都是真实材料，主模型被问起时才接得上话。
         diary_block = await self.diary_injection()
         if diary_block:
-            injection = f"{injection}\n{diary_block}" if injection else diary_block
+            base = f"{base}\n{diary_block}" if base else diary_block
+
+        # 可选：把周程也注入（默认关——规划只在生成侧起作用，不占每轮 token）
+        if bool(getattr(config.plan, "inject_in_chat", False)):
+            plans = await plan_module.load_current_chain(moment)
+            week = plans.get("week")
+            if week is not None and week.items:
+                focus = plan_module.today_focus(plans, moment)
+                head = f"【这周：{week.label}】"
+                if focus is not None:
+                    head += f"今天偏重：{focus.text}。"
+                base = f"{base}\n{head}" if base else head
 
         if config.plugin.debug_log:
-            logger.debug(f"[daily_schedule] 注入内容：\n{injection}")
-        return injection
+            logger.debug(
+                f"[daily_schedule] 注入内容（stream={stream_id or '-'}）：\n"
+                f"{base}\n{stream_text}"
+            )
+        return SceneTexts(base=base, stream=stream_text)
 
     # ── 让位 ──────────────────────────────────────────────────────────────────
 
@@ -878,8 +1394,11 @@ class ScheduleService(BaseService):
                     next_entry = f"{entry.start} {entry.doing}"
                     break
 
+        pool = await store.load_pool() if self.mode() == _MODE_POOL else None
+
         return {
             "date": day,
+            "mode": self.mode(),
             "has_schedule": schedule is not None and not schedule.is_empty,
             "entries": len(schedule.entries) if schedule else 0,
             "generated_at": schedule.generated_at if schedule else 0.0,
@@ -887,6 +1406,7 @@ class ScheduleService(BaseService):
             "persona_kind": schedule.persona_kind if schedule else "",
             "persona_name": schedule.persona_name if schedule else "",
             "sources_used": schedule.sources_used if schedule else [],
+            "archetype": schedule.archetype if schedule else "",
             "doing": doing,
             "busy": busy,
             "next": next_entry,
@@ -895,10 +1415,58 @@ class ScheduleService(BaseService):
             "yield_master": state.yield_master,
             "yield_until": state.yield_until,
             "generating": self.is_generating(),
+            "refreshing_pool": self.is_refreshing_pool(),
+            "planning": self.is_planning(),
             "last_error": state.last_error,
             "offline_enabled": bool(getattr(self.config.offline, "enabled", False)),
             "diary_dates": await store.recent_diary_dates(7),
+            "pool_id": pool.pool_id if pool else "",
+            "pool_expires_at": pool.refresh_at if pool else 0.0,
         }
+
+    async def pool_lines(self) -> list[str]:
+        """取池子状态的多行展示文本（命令用）。
+
+        Returns:
+            文本行列表。
+        """
+        if self.mode() != _MODE_POOL:
+            return ["  当前模式是 daily（每天生成一份），没有池子。"]
+        return pool_module.summary_lines(await store.load_pool())
+
+    async def plan_lines(self, moment: datetime | None = None) -> list[str]:
+        """取三层规划的多行展示文本（命令用）。
+
+        Args:
+            moment: 参考时间。
+
+        Returns:
+            文本行列表。
+        """
+        config = self.config
+        if not bool(getattr(config.plan, "enabled", True)):
+            return ["  规划层已关闭（plan.enabled = false）"]
+
+        now = moment or await self.current_time()
+        plans = await plan_module.load_current_chain(now)
+        pool_lines: dict[str, list[str]] = {}
+        for layer in plan_module.PLAN_LAYERS:
+            mapping = getattr(config.plan, f"{layer}_mode", None)
+            mode = str(mapping if mapping is not None else "pool")
+            pool = await store.load_plan_pool(layer)
+            if pool is None:
+                pool_lines[layer] = [f"型池：无（现在按 {mode} 模式直生成）"]
+                continue
+            expire = (
+                datetime.fromtimestamp(pool.refresh_at).strftime("%m-%d")
+                if pool.refresh_at
+                else "-"
+            )
+            pool_lines[layer] = [
+                f"型池：{len(pool.archetypes)} 套，到期 {expire}"
+                f"（模式 {mode}）"
+            ]
+        return plan_module.summary_lines(plans, pool_lines=pool_lines)
 
     async def recent_days(self, limit: int = 3) -> list[str]:
         """列出最近有日志的日期。
@@ -948,4 +1516,4 @@ class ScheduleService(BaseService):
         )
 
 
-__all__ = ["ScheduleService"]
+__all__ = ["SceneTexts", "ScheduleService"]

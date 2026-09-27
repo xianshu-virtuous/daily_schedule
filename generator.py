@@ -78,7 +78,10 @@ _GENERATE_SYSTEM = """\
    要求：第一人称、每条 8-20 字、口语化、有温度、各不相同。
    绝对不能出现「日程」「让位」「系统」「规则」「检测到」「优先级」这类词，
    也不要写成「主人来了所以我要让出时间」——要写成「是我自己更想陪你」。
-8. 如果给了「前几天的记录」，就让今天和它自然接得上（但不必重复昨天）。
+8. 【避免重复 · 重要】如果给了「前几天的记录」，那些是**已经用过的日程**，不是让你接着写的模板：
+   今天的安排要与它们**明显不同**——至少一半时段的场地或事件要换掉（作息骨架、小习惯可以保留，
+   但活动重心要变）。照抄昨天的骨架只换几个词，等于这个角色没有第二天。
+   连续性体现在「她昨天做过什么、今天自然延着过」，不是体现在段落结构与用词上。
 
 输出格式：
 {
@@ -110,7 +113,11 @@ def _format_entries(entries: list[ScheduleEntry]) -> str:
 
 
 async def _history_block(config: DailyScheduleConfig, today: date_cls) -> str:
-    """拼出前几天的日程与日志，作为生成时的连续性参考。
+    """拼出前几天的日程与日志，作为生成时的「已经用过」参考。
+
+    这里的措辞很关键：回喂给模型的是**它已经用过的安排**，目的是让它避开，
+    而不是让它接着写。早期版本写的是「让今天和它自然接得上」，模型的解法就是
+    照抄昨天的骨架换词——实测三天 13 段逐段对应，连细节都在重复。
 
     Args:
         config: 插件配置。
@@ -145,7 +152,7 @@ async def _history_block(config: DailyScheduleConfig, today: date_cls) -> str:
                     section.append("（当时发生：" + "；".join(recent) + "）")
 
         if section:
-            blocks.append(f"【{day}】\n" + "\n".join(section))
+            blocks.append(f"【{day}｜已用过】\n" + "\n".join(section))
 
     diary_text = await _diary_block(config, lookback)
     if diary_text:
@@ -189,6 +196,31 @@ async def _diary_block(config: DailyScheduleConfig, days: int) -> str:
     return "【它不在线的时候（真实发生过的）】\n" + "\n\n".join(blocks)
 
 
+def profile_block(profile: PersonaProfile) -> str:
+    """把人设判定结果渲染成提示词片段。
+
+    daily 模式与池子（``pool.py``）共用同一份措辞，免得两处漂移。
+
+    Args:
+        profile: 人设判定结果。
+
+    Returns:
+        多行文本；没有内容时返回空字符串。
+    """
+    lines = [f"类型：{'扮演已有角色' if profile.is_roleplay else '原创角色（原创 OC）'}"]
+    if profile.character_name:
+        lines.append(f"角色名：{profile.character_name}")
+    if profile.source_work:
+        lines.append(f"出处：{profile.source_work}")
+    if profile.world:
+        lines.append(f"世界观：{profile.world}")
+    if profile.occupation:
+        lines.append(f"平日身份：{profile.occupation}")
+    if profile.anchors:
+        lines.append("日常锚点：" + "、".join(profile.anchors))
+    return "\n".join(lines)
+
+
 def _build_user_prompt(
     config: DailyScheduleConfig,
     snapshot: PersonaSnapshot,
@@ -196,6 +228,7 @@ def _build_user_prompt(
     bundle: sources.SourceBundle,
     history: str,
     now: datetime,
+    plan_block: str = "",
 ) -> str:
     """组装日程生成的用户提示词。
 
@@ -206,6 +239,7 @@ def _build_user_prompt(
         bundle: 素材包。
         history: 前几天记录文本。
         now: 当前时间。
+        plan_block: 年 / 月 / 周程文本（周程定义日程该干什么）。
 
     Returns:
         用户提示词。
@@ -216,20 +250,14 @@ def _build_user_prompt(
     if persona_block:
         parts.append("【人设】\n" + persona_block)
 
-    profile_lines = [
-        f"类型：{'扮演已有角色' if profile.is_roleplay else '原创角色（原创 OC）'}"
-    ]
-    if profile.character_name:
-        profile_lines.append(f"角色名：{profile.character_name}")
-    if profile.source_work:
-        profile_lines.append(f"出处：{profile.source_work}")
-    if profile.world:
-        profile_lines.append(f"世界观：{profile.world}")
-    if profile.occupation:
-        profile_lines.append(f"平日身份：{profile.occupation}")
-    if profile.anchors:
-        profile_lines.append("日常锚点：" + "、".join(profile.anchors))
-    parts.append("【人设梳理】\n" + "\n".join(profile_lines))
+    profile_lines = profile_block(profile)
+    if profile_lines:
+        parts.append("【人设梳理】\n" + profile_lines)
+
+    if plan_block:
+        parts.append(
+            "【它的年程 / 月程 / 周程（今天要照着周程来安排）】\n" + plan_block
+        )
 
     memory_block = bundle.memory_block()
     if memory_block:
@@ -240,7 +268,9 @@ def _build_user_prompt(
         parts.append("【联网查到的参考（只取与角色日常相关的信息）】\n" + internet_block)
 
     if history:
-        parts.append("【前几天的记录】\n" + history)
+        parts.append(
+            "【前几天的记录（已经用过的安排，今天要避开它们的骨架）】\n" + history
+        )
 
     parts.append(
         f"【今天】{now.strftime('%Y-%m-%d')}，现在是 {now.strftime('%H:%M')}（本地时间）。"
@@ -248,6 +278,7 @@ def _build_user_prompt(
     parts.append(
         f"请安排 {config.schedule.min_entries}-{config.schedule.max_entries} 条条目，"
         "完整覆盖今天 00:00 到 23:59，并按格式输出 JSON。"
+        "记住：上面的前几天记录是**已经写过的**，今天的场地与事件至少一半要和它们不同。"
     )
 
     return "\n\n".join(parts)
@@ -358,6 +389,7 @@ async def generate_daily_schedule(
     *,
     day: date_cls | None = None,
     now: datetime | None = None,
+    plan_block: str = "",
 ) -> DailySchedule | None:
     """生成一天的日程并落盘。
 
@@ -368,6 +400,7 @@ async def generate_daily_schedule(
         profile: 人设判定结果。
         day: 目标日期，默认今天。
         now: 当前时间，默认取系统时间。
+        plan_block: 年 / 月 / 周程文本（周程定义日程该干什么）。
 
     Returns:
         生成成功的日程；失败返回 ``None``。
@@ -385,7 +418,9 @@ async def generate_daily_schedule(
     )
 
     history = await _history_block(config, target_day)
-    user_prompt = _build_user_prompt(config, snapshot, profile, bundle, history, moment)
+    user_prompt = _build_user_prompt(
+        config, snapshot, profile, bundle, history, moment, plan_block=plan_block
+    )
 
     if config.plugin.debug_log:
         logger.debug(f"[daily_schedule] 日程生成提示词：\n{user_prompt}")
@@ -443,22 +478,7 @@ async def generate_daily_schedule(
     )
 
     await store.save_schedule(schedule)
-    if config.log.enabled:
-        await store.save_log(
-            schedule.date,
-            {
-                "date": schedule.date,
-                "generated_at": schedule.generated_at,
-                "model_tag": schedule.model_tag,
-                "persona_kind": schedule.persona_kind,
-                "persona_name": schedule.persona_name,
-                "sources_used": schedule.sources_used,
-                "entries": [entry.to_dict() for entry in schedule.entries],
-                "yield_lines": schedule.yield_lines,
-                "yesterday_summary": schedule.yesterday_summary,
-                "events": [],
-            },
-        )
+    await record_schedule_log(schedule, log_enabled=bool(config.log.enabled))
 
     await _record_success()
     logger.info(
@@ -466,6 +486,44 @@ async def generate_daily_schedule(
         f"素材层={','.join(bundle.used) or '无'}，模型={result.model_tag}"
     )
     return schedule
+
+
+async def record_schedule_log(schedule: DailySchedule, *, log_enabled: bool = True) -> None:
+    """把一份日程写进当天日志（生成路径与池子抽取路径共用）。
+
+    以前这段逻辑长在 ``generate_daily_schedule`` 里，而且每次都把 ``events`` 重置成
+    空列表——当天早上重生成一次日程，就把那天已经发生的让位事件抹掉了。这里改成
+    **保留已有事件**，顺手把这个小毛病修掉。
+
+    Args:
+        schedule: 要记录的日程。
+        log_enabled: ``log.enabled`` 为假时只写日程、不写日志。
+    """
+    if not log_enabled:
+        return
+
+    existing = await store.load_log(schedule.date)
+    events: list[Any] = []
+    if isinstance(existing, dict) and isinstance(existing.get("events"), list):
+        events = [str(item) for item in existing["events"] if str(item).strip()]
+
+    await store.save_log(
+        schedule.date,
+        {
+            "date": schedule.date,
+            "generated_at": schedule.generated_at,
+            "model_tag": schedule.model_tag,
+            "persona_kind": schedule.persona_kind,
+            "persona_name": schedule.persona_name,
+            "sources_used": schedule.sources_used,
+            "entries": [entry.to_dict() for entry in schedule.entries],
+            "yield_lines": schedule.yield_lines,
+            "yesterday_summary": schedule.yesterday_summary,
+            "archetype": schedule.archetype,
+            "pool_id": schedule.pool_id,
+            "events": events,
+        },
+    )
 
 
 async def append_log_event(day: str, text: str) -> None:
@@ -510,4 +568,6 @@ __all__ = [
     "append_log_event",
     "ensure_persona_profile",
     "generate_daily_schedule",
+    "profile_block",
+    "record_schedule_log",
 ]
