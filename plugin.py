@@ -9,17 +9,17 @@
 - 日程来源两种模式（``schedule.mode``）：``pool``（默认）每隔几天编几套「日型」、
   每天抽一套（变化靠轮换、不花调用），``daily`` 每天让模型写一份；池子不可用时回退 daily，
   见 :mod:`pool`；周程会给今天点名重点，命中日型标签时优先用它；
-- 离线随机评估（``offline.roll_enabled``）：离线回来时对周 / 月的推进项掷一次骰
-  （默认八成顺利、两成卡住），结果落盘并写进日记的情绪里；
-- 人设类型判定按指纹缓存，日程生成最多每天一次（池子模式下每日抽取不调模型）；
+- 离线判定（``offline.roll_enabled``）：**只判日程层**——每天一次掷骰，忙碌等级与
+  「忙时被打断」都参与；周 / 月 / 年 / 推进项的完成度靠**下级 50% 上卷**算出来，
+  全程零模型调用，见 :mod:`progress`；情绪也由最近几天的成功日比例推出；
+- 离线日记（``offline.enabled``，**默认关闭**）：启动时把「它不在线的这段时间」结合当天日程
+  与记忆缝成第一人称日记，按天存进 ``data``，见 :mod:`diary`；判定不依赖它。
 - 生成结果落盘成日志，注入时只提供一句「你此刻正在做什么」的旁白，
   不强制场景、不强调、不追加规则；
 - 主人出现时（权限系统判定）把日程时间让出来，措辞取自角色自己的心声池；
   这份让位只写进触发它的那个会话（流私有 reminder），不会串到别的群；
 - 时间一律以 time_sense 为准，它缺席时退回系统时间（见 ``service.current_time``）；
-  time_sense 是**可选**的运行时探测（manifest 里不写依赖，否则缺它会被框架静默剔除）；
-- 离线生活（默认关闭）：启动时把「它不在线的这段时间」结合当天日程与记忆缝成
-  第一人称日记，按天存进 ``data``，见 :mod:`diary`。
+  time_sense 是**可选**的运行时探测（manifest 里不写依赖，否则缺它会被框架静默剔除）。
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from src.app.plugin_system.base import BasePlugin, register_plugin
 from src.kernel.concurrency import get_task_manager
 from src.kernel.scheduler import TriggerType, get_unified_scheduler
 
-from .commands import ScheduleCommand
+from .commands import GoalCommand, ScheduleCommand
 from .config import DailyScheduleConfig
 from .handlers import OwnerPresenceHandler, SceneInjectorHandler
 from .service import TIME_SENSE_SIGNATURE, ScheduleService
@@ -100,8 +100,8 @@ class DailySchedulePlugin(BasePlugin):
 
     plugin_name: str = "daily_schedule"
     plugin_description: str = (
-        "让 Bot 拥有自己的日程：预生成一天、回答「你在做什么」、主人来时让出时间；"
-        "配合 time_sense 把「不在线的那段时间」记成日记"
+        "让 Bot 拥有自己的时间：三层规划（年程→月程→周程）定方向、日程池每日轮换抽取、"
+        "主人来时只在触发会话让位；判定只落在日程层，完成度按下级 50% 上卷"
     )
     plugin_version: str = "1.2.0"
     configs: list[type] = [DailyScheduleConfig]
@@ -133,6 +133,7 @@ class DailySchedulePlugin(BasePlugin):
             SceneInjectorHandler,
             OwnerPresenceHandler,
             ScheduleCommand,
+            GoalCommand,
         ]
 
     # ── 生命周期 ──────────────────────────────────────────────────────────────

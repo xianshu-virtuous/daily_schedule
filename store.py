@@ -433,6 +433,60 @@ async def load_persona_profile() -> PersonaProfile | None:
     return PersonaProfile.from_dict(await _load_raw(PERSONA_KEY))
 
 
+async def load_logs(dates: list[str]) -> dict[str, dict[str, Any]]:
+    """批量读取若干天的日志（完成度计算用一次读一批，不要一天一个来回）。
+
+    Args:
+        dates: 日期列表（``YYYY-MM-DD``）。
+
+    Returns:
+        ``{日期: 日志内容}``；读不到的日期不出现。
+    """
+    result: dict[str, dict[str, Any]] = {}
+    for date_str in dates:
+        payload = await _load_raw(log_key(date_str))
+        if isinstance(payload, dict):
+            result[date_str] = payload
+    return result
+
+
+async def day_outcomes(dates: list[str] | None = None, *, limit: int = 0) -> dict[str, dict]:
+    """取已判定过的日 → 判定记录。
+
+    Args:
+        dates: 指定日期；``None`` 表示扫最近 ``limit`` 天。
+        limit: ``dates`` 为 ``None`` 时的天数上限。
+
+    Returns:
+        ``{日期: 判定记录}``。
+    """
+    if dates is None:
+        dates = await recent_log_dates(limit or 40)
+    logs = await load_logs(list(dates))
+    return {
+        day: payload["outcome"]
+        for day, payload in logs.items()
+        if isinstance(payload.get("outcome"), dict)
+    }
+
+
+async def focus_by_day(dates: list[str]) -> dict[str, str]:
+    """取「日期 → 当天抽取日程时周程点的重点」。
+
+    Args:
+        dates: 日期列表。
+
+    Returns:
+        ``{日期: 重点文本}``（没有重点的日期不出现）。
+    """
+    logs = await load_logs(list(dates))
+    return {
+        day: str(payload.get("focus") or "")
+        for day, payload in logs.items()
+        if str(payload.get("focus") or "").strip()
+    }
+
+
 async def save_persona_profile(profile: PersonaProfile) -> bool:
     """写入人设判定缓存。
 
@@ -577,9 +631,12 @@ __all__ = [
     "STORE_NAME",
     "delete_plan_pool_staging",
     "delete_pool_staging",
+    "day_outcomes",
     "diary_key",
+    "focus_by_day",
     "load_diary",
     "load_log",
+    "load_logs",
     "load_persona_profile",
     "load_plan",
     "load_plan_pool",

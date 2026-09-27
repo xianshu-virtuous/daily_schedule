@@ -54,12 +54,14 @@ MODULES = [
     "daily_schedule.scene",
     "daily_schedule.pool",
     "daily_schedule.plan",
+    "daily_schedule.progress",
     "daily_schedule.diary",
     "daily_schedule.generator",
     "daily_schedule.service",
     "daily_schedule.handlers.owner_presence",
     "daily_schedule.handlers.scene_injector",
     "daily_schedule.commands.schedule_command",
+    "daily_schedule.commands.goal_command",
     "daily_schedule.plugin",
 ]
 
@@ -167,9 +169,17 @@ check("scene.yield_stream_scope 默认开（让位不串群）", bool(config.sce
 check("scene.hint_only_when_busy 默认开", bool(config.scene.hint_only_when_busy) is True)
 check("offline.inject_enabled 默认开", bool(config.offline.inject_enabled) is True)
 check("offline.inject_turns 默认 3（日记限次注入）", int(config.offline.inject_turns) == 3)
+check(
+    "offline.auto_enable_with_time_sense 默认关（日记默认关闭）",
+    bool(config.offline.auto_enable_with_time_sense) is False,
+)
 check("offline.roll_enabled 默认开", bool(config.offline.roll_enabled) is True)
 check("offline.roll_success_rate 默认 0.8", abs(float(config.offline.roll_success_rate) - 0.8) < 1e-6)
+check("progress.rollup_threshold 默认 0.5（下级 50% 上卷）", abs(float(config.progress.rollup_threshold) - 0.5) < 1e-6)
+check("progress.interrupt_penalty 默认 0.2", abs(float(config.progress.interrupt_penalty) - 0.2) < 1e-6)
+check("progress.inject_mood 默认关", bool(config.progress.inject_mood) is False)
 check("plan.enabled 默认开", bool(config.plan.enabled) is True)
+check("plan.announce_year 默认开（元旦分享年目标）", bool(config.plan.announce_year) is True)
 for layer in ("year", "month", "week"):
     check(f"plan.{layer}_mode 默认 pool", str(getattr(config.plan, f"{layer}_mode")) == "pool")
 check("plan.inject_in_chat 默认关（规划不占每轮 token）", bool(config.plan.inject_in_chat) is False)

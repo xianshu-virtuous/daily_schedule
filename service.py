@@ -43,7 +43,7 @@ from src.app.plugin_system.base import BaseService
 from src.app.plugin_system.types import PermissionLevel
 from src.kernel.concurrency import get_task_manager
 
-from . import diary, generator, plan as plan_module, pool as pool_module, scene, store
+from . import diary, generator, plan as plan_module, pool as pool_module, progress as progress_module, scene, store
 from .config import DailyScheduleConfig
 from .models import BUSY_LABELS, DailySchedule, RuntimeState
 from .persona import read_persona
@@ -365,34 +365,20 @@ class ScheduleService(BaseService):
 
         result["span"] = span
 
-        # 随机评估：离线回来时，对「这周 / 这月正在推进的事」掷一次骰
-        # （八成顺利、两成卡住）。结果落盘进计划文件，所以同一条不会重掷。
+        # 判定：只落在日程层（主人定的口径：判定只需判日程，上层靠 50% 上卷）。
+        # 离线跨掉的每一天各判一次，纯本地计算 + 一次掷骰，不花模型调用。
         moment_now = await self.current_time()
-        plan_text = await self._plan_block(moment_now)
+        judged: list[tuple[str, dict[str, Any]]] = await self.judge_elapsed_days(
+            span, now=moment_now
+        )
         outcome_lines = ""
         outcome_items: list[str] = []
-        try:
-            state = await store.load_state()
-            today = moment_now.date().isoformat()
-            if getattr(state, "last_roll_date", "") == today:
-                logger.debug("[daily_schedule] 今天已经评估过了，跳过随机评估")
-            else:
-                plans = await plan_module.load_current_chain(moment_now)
-                outcomes = plan_module.roll_progress(
-                    self.config, plans, moment=moment_now
-                )
-                if outcomes:
-                    await plan_module.advance_progress(plans, outcomes)
-                    outcome_lines = plan_module.outcome_block(outcomes)
-                    outcome_items = [
-                        f"{item.text}：{'顺利' if progress == 'ok' else '卡住了'}"
-                        for item, progress in outcomes
-                    ]
-                    state.last_roll_date = today
-                    await store.save_state(state)
-                    logger.info("[daily_schedule] 随机评估：" + "；".join(outcome_items))
-        except Exception as error:  # noqa: BLE001 - 评估失败不该影响日记
-            logger.warning(f"[daily_schedule] 随机评估失败: {error}")
+        for day, outcome in judged:
+            outcome_items.append(f"{day}：{progress_module.describe_outcome(outcome)}")
+        if outcome_items:
+            outcome_lines = "\n".join(f"- {line}" for line in outcome_items)
+
+        plan_text = await self._plan_block(moment_now)
 
         try:
             entry = await diary.record_offline(
@@ -619,9 +605,19 @@ class ScheduleService(BaseService):
         async def _job() -> None:
             try:
                 moment = await self.current_time()
+                before = await plan_module.load_current_chain(moment)
+                year_before = before.get("year")
                 await plan_module.ensure_chain(
                     self.config, self.plugin, now=moment, force=force
                 )
+                after = await plan_module.load_current_chain(moment)
+                year_after = after.get("year")
+                # 新的一年（或第一次装上）就主动把年目标分享给主人
+                if (
+                    year_after is not None
+                    and (year_before is None or year_before.period != year_after.period)
+                ):
+                    await self.announce_year(year_after)
                 # 规划一变，今天的日程也该跟着重排一次（抽取不花钱）
                 if self.mode() == _MODE_POOL:
                     existing = await store.load_schedule(moment.date().isoformat())
@@ -641,6 +637,37 @@ class ScheduleService(BaseService):
             self._release_planning()
             return False
         return True
+
+    async def announce_year(self, year: Any) -> None:
+        """把年目标主动分享出去（主人定的：一月一日分享，顺带写进日记）。
+
+        分享到哪里：最近一次主人开口的那个会话（``state.last_stream_id``）。
+        没有已知会话时只记日志——年目标随时可以用 ``/目标`` 查。
+
+        Args:
+            year: 年程计划。
+        """
+        if year is None or not bool(getattr(self.config.plan, "announce_year", True)):
+            return
+
+        head = f"新的一年我想这么过：{year.label}"
+        if year.mood:
+            head += f"——{year.mood}"
+        detail = "；".join(item.text for item in year.items[:3])
+        text = head + (f"\n先记下几件想做的事：{detail}" if detail else "")
+
+        state = await store.load_state()
+        stream_id = (state.last_stream_id or state.yield_stream_id or "").strip()
+        if not stream_id:
+            logger.info(f"[daily_schedule] 年目标已生成（还没有已知会话，只记日志）：{year.label}")
+            return
+        try:
+            from src.app.plugin_system.api.send_api import send_text
+
+            await send_text(text, stream_id=stream_id)
+            logger.info(f"[daily_schedule] 已把年目标分享给主人：{year.label}")
+        except Exception as error:  # noqa: BLE001 - 分享失败不该影响别的
+            logger.warning(f"[daily_schedule] 分享年目标失败: {error}")
 
     async def _ensure_plans(self, moment: datetime) -> bool:
         """三层规划有缺失或过期就排一次后台补齐。
@@ -1166,6 +1193,8 @@ class ScheduleService(BaseService):
 
         await self._ensure_pool_fresh(moment)
         await self._ensure_plans(moment)
+        # 兜底判定昨天：进程长期不重启时，也保证每天都有一个判定（纯本地，不调模型）
+        await self.judge_elapsed_days(None, now=moment, days_back=1)
 
         existing = await store.load_schedule(day)
         if not self._is_stale(existing, moment):
@@ -1283,6 +1312,13 @@ class ScheduleService(BaseService):
                     head += f"今天偏重：{focus.text}。"
                 base = f"{base}\n{head}" if base else head
 
+        # 可选：把情绪也注入（默认关，省 token；情绪先只用于日记与 /目标）
+        if bool(getattr(config.progress, "inject_mood", False)):
+            state = await store.load_state()
+            if state.mood:
+                mood = f"（她{progress_module.mood_line(state.mood, state.mood_note)}）"
+                base = f"{base}\n{mood}" if base else mood
+
         if config.plugin.debug_log:
             logger.debug(
                 f"[daily_schedule] 注入内容（stream={stream_id or '-'}）：\n"
@@ -1347,6 +1383,9 @@ class ScheduleService(BaseService):
         state.yield_doing = doing
         state.yield_stream_id = stream_id or state.yield_stream_id
         state.yield_master = master_name or state.yield_master
+        if stream_id:
+            # 记下最近一次主人开口的会话：年目标要在元旦那天主动分享到这里
+            state.last_stream_id = stream_id
 
         if not was_yielding:
             # 新一段让位：重新抽一条心声，让每段让位听起来都不一样
@@ -1355,6 +1394,13 @@ class ScheduleService(BaseService):
             if doing:
                 detail += f"，当时在{doing}"
             await generator.append_log_event(moment.date().isoformat(), detail)
+            # 结构化记一笔「被打断」：日程层的成功判定要知道当时的忙碌等级
+            # （在忙的时段被打断才扣成功概率，空闲时被打断不扣）
+            entry_now = schedule.entry_at(moment) if schedule is not None else None
+            busy_now = int(entry_now.busy) if entry_now is not None else 0
+            await generator.append_log_interrupt(
+                moment.date().isoformat(), busy=busy_now, doing=doing
+            )
             logger.info(f"[daily_schedule] {detail}")
 
         await store.save_state(state)
@@ -1422,6 +1468,9 @@ class ScheduleService(BaseService):
             "diary_dates": await store.recent_diary_dates(7),
             "pool_id": pool.pool_id if pool else "",
             "pool_expires_at": pool.refresh_at if pool else 0.0,
+            "mood": state.mood,
+            "mood_note": state.mood_note,
+            "last_roll_date": state.last_roll_date,
         }
 
     async def pool_lines(self) -> list[str]:
@@ -1433,6 +1482,176 @@ class ScheduleService(BaseService):
         if self.mode() != _MODE_POOL:
             return ["  当前模式是 daily（每天生成一份），没有池子。"]
         return pool_module.summary_lines(await store.load_pool())
+
+    async def judge_elapsed_days(
+        self,
+        span: dict[str, Any] | None = None,
+        *,
+        now: datetime | None = None,
+        days_back: int = 1,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """给已经过完、还没判定的日子做成功判定（纯本地，不调模型）。
+
+        判定覆盖两处调用：
+
+        - 离线结算：离线跨度里的每一天（不含回来的那天，那天还没过完）；
+        - 巡检兜底：昨天（进程长期不重启时，也保证每天都有判定）。
+
+        判过的日子有 ``outcome`` 记录，不会重复判。结果写进当天日志，
+        周 / 月 / 年 / 推进项的完成度都由它按「下级 50% 上卷」算出来。
+
+        Args:
+            span: 离线跨度（``time_sense.offline_span()`` 的返回，可空）。
+            now: 参考时间。
+            days_back: 没有跨度时往前判几天（默认昨天一天）。
+
+        Returns:
+            ``[(日期, 判定记录)]``。
+        """
+        config = self.config
+        if not bool(getattr(config.offline, "roll_enabled", True)):
+            return []
+
+        moment = now or await self.current_time()
+        today = moment.date()
+
+        candidates: list[str] = []
+        if isinstance(span, dict):
+            try:
+                from_ts = float(span.get("from_ts") or 0.0)
+                to_ts = float(span.get("to_ts") or 0.0)
+            except (TypeError, ValueError):
+                from_ts = to_ts = 0.0
+            if from_ts > 0 and to_ts >= from_ts:
+                start = datetime.fromtimestamp(from_ts).date()
+                end = datetime.fromtimestamp(to_ts).date()
+                cursor = start
+                while cursor <= end:
+                    if cursor < today:
+                        candidates.append(cursor.isoformat())
+                    cursor += timedelta(days=1)
+        if not candidates:
+            for offset in range(1, max(1, days_back) + 1):
+                candidates.append((today - timedelta(days=offset)).isoformat())
+
+        limit = max(1, int(getattr(config.progress, "max_days", 7)))
+        candidates = sorted(set(candidates))[-limit:]
+
+        existing = await store.day_outcomes(candidates)
+        judged: list[tuple[str, dict[str, Any]]] = []
+        for day in candidates:
+            if day in existing:
+                continue
+            schedule = await store.load_schedule(day)
+            if schedule is None or schedule.is_empty:
+                continue
+            payload = await store.load_log(day)
+            interrupts = []
+            if isinstance(payload, dict) and isinstance(payload.get("interrupts"), list):
+                interrupts = [item for item in payload["interrupts"] if isinstance(item, dict)]
+            try:
+                outcome = progress_module.judge_day(
+                    config, day=day, schedule=schedule, interrupts=interrupts, now=moment
+                )
+            except Exception as error:  # noqa: BLE001 - 判定失败不该影响别的
+                logger.warning(f"[daily_schedule] 判定 {day} 失败: {error}")
+                continue
+            await generator.save_day_outcome(day, outcome)
+            judged.append((day, outcome))
+            logger.info(
+                f"[daily_schedule] 日程判定 {day}：{progress_module.describe_outcome(outcome)}"
+            )
+
+        if judged:
+            await self._refresh_mood(moment)
+        return judged
+
+    async def _refresh_mood(self, moment: datetime) -> None:
+        """按最近几天的成功日比例刷新情绪（不花调用，也不注入）。"""
+        try:
+            outcomes = await store.day_outcomes()
+            level, note = progress_module.mood_of(self.config, outcomes, today=moment.date())
+            state = await store.load_state()
+            state.mood = level
+            state.mood_note = note
+            await store.save_state(state)
+            logger.info(f"[daily_schedule] 情绪：{progress_module.mood_line(level, note)}")
+        except Exception as error:  # noqa: BLE001 - 情绪算不出来不影响别的
+            logger.debug(f"[daily_schedule] 刷新情绪失败: {error}")
+
+    async def goal_lines(self, moment: datetime | None = None) -> list[str]:
+        """取 ``/目标`` 要展示的内容：年目标 / 月忙闲 / 本周主题 / 当前时段。
+
+        Args:
+            moment: 参考时间。
+
+        Returns:
+            文本行列表。
+        """
+        now = moment or await self.current_time(touch=True, reason="查看目标")
+        config = self.config
+        plans = await plan_module.load_current_chain(now)
+        completion = await plan_module.completion_snapshot(config, plans, moment=now)
+
+        lines: list[str] = []
+        year = plans.get("year")
+        month = plans.get("month")
+        week = plans.get("week")
+
+        if year is not None:
+            lines.append(
+                f"【今年】{year.label}：{year.mood or '（没写基调）'}"
+                f" ｜ {plan_module.completion_line(completion.get('year') or {})}"
+            )
+            for item in year.items:
+                lines.append(f"  · {item.text}" + (f"（{item.why}）" if item.why else ""))
+        else:
+            lines.append("【今年】还没有年目标（下次生成时会补）")
+
+        if month is not None:
+            kind = "忙碌月" if month.kind == "busy" else "空闲月"
+            lines.append(
+                f"【本月】{month.period} {month.label}（{kind}）"
+                f" ｜ {plan_module.completion_line(completion.get('month') or {})}"
+            )
+            for item in month.items:
+                lines.append(f"  · {item.text}")
+        else:
+            lines.append("【本月】还没有月程")
+
+        if week is not None:
+            lines.append(
+                f"【本周】{week.period} {week.label}"
+                f" ｜ {plan_module.completion_line(completion.get('week') or {})}"
+            )
+            for item in completion.get("items") or []:
+                mark = "✔" if item.get("complete") else "·"
+                focus = ""
+                for raw in week.items:
+                    if raw.text == item.get("text"):
+                        focus = f"（偏重 {'、'.join(raw.focus_days)}）" if raw.focus_days else ""
+                        break
+                lines.append(
+                    f"  {mark} {item.get('text')}{focus}"
+                    f" ｜ {item.get('ok')}/{item.get('judged')} 天顺"
+                )
+        else:
+            lines.append("【本周】还没有周程")
+
+        schedule = await store.load_schedule(now.date().isoformat())
+        doing, busy = scene.describe_now(schedule, now)
+        busy_label = {0: "空闲", 1: "较忙", 2: "很忙"}.get(busy, "空闲")
+        if doing:
+            lines.append(f"【此刻】{doing}（{busy_label}）")
+        else:
+            lines.append("【此刻】没有日程（可能还没生成）")
+
+        state = await store.load_state()
+        if state.mood:
+            lines.append(
+                f"【心情】{progress_module.mood_line(state.mood, state.mood_note)}"
+            )
+        return lines
 
     async def plan_lines(self, moment: datetime | None = None) -> list[str]:
         """取三层规划的多行展示文本（命令用）。
@@ -1466,7 +1685,8 @@ class ScheduleService(BaseService):
                 f"型池：{len(pool.archetypes)} 套，到期 {expire}"
                 f"（模式 {mode}）"
             ]
-        return plan_module.summary_lines(plans, pool_lines=pool_lines)
+        completion = await plan_module.completion_snapshot(config, plans, moment=now)
+        return plan_module.summary_lines(plans, pool_lines=pool_lines, completion=completion)
 
     async def recent_days(self, limit: int = 3) -> list[str]:
         """列出最近有日志的日期。

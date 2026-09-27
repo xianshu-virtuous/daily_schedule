@@ -647,13 +647,12 @@ check("替换后清掉半成品", _mem["staging"] is None)
 section("6. 三层规划：年程 → 月程 → 周程")
 
 from daily_schedule import plan as plan_mod  # noqa: E402
+from daily_schedule import progress as progress_mod  # noqa: E402
 from daily_schedule.models import (  # noqa: E402
     PLAN_KIND_REST,
     PLAN_LAYER_MONTH,
     PLAN_LAYER_WEEK,
     PLAN_LAYER_YEAR,
-    PLAN_PROGRESS_OK,
-    PLAN_PROGRESS_STUCK,
     PeriodPlan,
     PlanItem,
     PlanPool,
@@ -742,46 +741,173 @@ rest_filled = plan_mod.compose_from_pool(
 check("上层是休息期 → 抽休息型", rest_filled is not None and rest_filled.kind == PLAN_KIND_REST, getattr(rest_filled, "kind", None))
 
 # 随机评估：八成成功、两成失败；只评估未评估过的；结果落盘后不重掷
-roll_plan = PeriodPlan(
-    layer=PLAN_LAYER_WEEK,
-    period="2026-W41",
-    title="测试周",
-    items=[PlanItem(text=f"事项{i}") for i in range(200)],
+# 判定只落在日程层：忙碌等级 + 忙时被打断会影响成功率（一天一次掷骰，不调模型）
+def busy_day(*levels: int):
+    """造一天日程，按时段给定忙碌等级。"""
+    from daily_schedule.models import ScheduleEntry
+
+    count = max(1, len(levels))
+    span = 24 * 60 // count
+    entries = []
+    for index, level in enumerate(levels):
+        begin = index * span
+        end = 24 * 60 - 1 if index == count - 1 else (index + 1) * span
+        entries.append(
+            ScheduleEntry(
+                start=f"{begin // 60:02d}:{begin % 60:02d}",
+                end=f"{end // 60:02d}:{end % 60:02d}",
+                doing=f"第 {index} 段",
+                busy=level,
+            )
+        )
+    return DailySchedule(date="2026-09-29", entries=entries)
+
+
+idle_schedule = busy_day(0, 0, 0)
+busy_schedule = busy_day(0, 2, 1)
+check("最忙一档取全天最大值", progress_mod.busy_of(busy_schedule) == 2, str(progress_mod.busy_of(busy_schedule)))
+
+same_roll = random.Random(7)
+idle_outcome = progress_mod.judge_day(
+    config, day="2026-09-29", schedule=idle_schedule, interrupts=[], rng=same_roll
 )
-outcomes = plan_mod.roll_progress(
-    config, {PLAN_LAYER_WEEK: roll_plan}, moment=MONDAY, rng=random.Random(20260928)
+busy_outcome = progress_mod.judge_day(
+    config, day="2026-09-29", schedule=busy_schedule, interrupts=[], rng=random.Random(7)
 )
-ok_count = sum(1 for _, result in outcomes if result == PLAN_PROGRESS_OK)
-check("所有未评估项都被评估", len(outcomes) == 200, str(len(outcomes)))
+check("空闲日有加成 → 成功率高于基准", idle_outcome["rate"] > 0.8, str(idle_outcome["rate"]))
+check("忙日没有加成（就等于基准）", abs(busy_outcome["rate"] - 0.8) < 1e-6, str(busy_outcome["rate"]))
+
+interrupted = progress_mod.judge_day(
+    config,
+    day="2026-09-29",
+    schedule=busy_schedule,
+    interrupts=[{"busy": 2}, {"busy": 1}],
+    rng=random.Random(7),
+)
 check(
-    "成功率贴近 0.8",
-    0.7 <= ok_count / 200 <= 0.9,
-    f"{ok_count}/200 = {ok_count / 200:.2f}",
+    "在忙的时段被打断会扣成功率（很忙算两档）",
+    interrupted["rate"] < busy_outcome["rate"] and interrupted["busy_interrupts"] == 3,
+    f"rate={interrupted['rate']} busy_interrupts={interrupted['busy_interrupts']}",
 )
-check("结果写进了推进项", all(item.progress for item, _ in outcomes))
-again = plan_mod.roll_progress(config, {PLAN_LAYER_WEEK: roll_plan}, moment=MONDAY, rng=random.Random(1))
-check("同一条不重复掷（重启不会换结果）", again == [], str(len(again)))
-
-config.offline.roll_enabled = False
+idle_interrupt = progress_mod.judge_day(
+    config,
+    day="2026-09-29",
+    schedule=idle_schedule,
+    interrupts=[{"busy": 0}, {"busy": 0}],
+    rng=random.Random(7),
+)
+check("空闲时被打断不扣", abs(idle_interrupt["rate"] - idle_outcome["rate"]) < 1e-6, str(idle_interrupt["rate"]))
 check(
-    "关掉随机评估后不掷",
-    plan_mod.roll_progress(config, {PLAN_LAYER_WEEK: PeriodPlan(layer=PLAN_LAYER_WEEK, period="x", title="x", items=[PlanItem(text="y")])}, moment=MONDAY)
-    == [],
+    "成功率被钳制在合理区间",
+    0.0 < progress_mod.judge_day(
+        config, day="2026-09-29", schedule=busy_schedule,
+        interrupts=[{"busy": 2}] * 20, rng=random.Random(1),
+    )["rate"] >= 0.05,
 )
-config.offline.roll_enabled = True
-check("评估结果能渲染成材料", "顺利" in plan_mod.outcome_block(outcomes[:1]) or "不顺利" in plan_mod.outcome_block(outcomes[:1]))
+check(
+    "判定记录写得清来龙去脉",
+    all(key in interrupted for key in ("ok", "rate", "roll", "base", "busy_peak", "busy_interrupts")),
+    str(sorted(interrupted)),
+)
+check(
+    "判定能说成一句话",
+    "成功率" in progress_mod.describe_outcome(interrupted)
+    and ("算成了" in progress_mod.describe_outcome(interrupted) or "没算成" in progress_mod.describe_outcome(interrupted)),
+    progress_mod.describe_outcome(interrupted),
+)
 
-saved_plans: list[str] = []
+# 500 次采样：基准 0.8、无打断、空闲日加成后，成功比例应落在 0.82~0.88
+rng = random.Random(20260928)
+ok_count = sum(
+    1
+    for _ in range(500)
+    if progress_mod.judge_day(
+        config, day="2026-09-29", schedule=idle_schedule, interrupts=[], rng=rng
+    )["ok"]
+)
+check("空闲日的成功比例贴近 0.85", 0.82 <= ok_count / 500 <= 0.88, f"{ok_count}/500 = {ok_count / 500:.2f}")
+
+rng = random.Random(20260928)
+busy_ok = sum(
+    1
+    for _ in range(500)
+    if progress_mod.judge_day(
+        config,
+        day="2026-09-29",
+        schedule=busy_schedule,
+        interrupts=[{"busy": 1}],
+        rng=rng,
+    )["ok"]
+)
+check("忙时被打断的成功比例明显更低", busy_ok / 500 < 0.7, f"{busy_ok}/500 = {busy_ok / 500:.2f}")
+
+# 完成度：下级 50% 以上上卷（纯计算，零模型调用）
+def outcome(ok: bool) -> dict:
+    return {"ok": ok, "rate": 0.8, "roll": 0.5, "busy_peak": 1, "interrupts": 0, "busy_interrupts": 0}
 
 
-async def _fake_save_plan(plan):
-    saved_plans.append(plan.period)
-    return True
+week_days = [f"2026-09-{day:02d}" for day in range(28, 31)] + [f"2026-10-{day:02d}" for day in range(1, 5)]
+check("周标识从日期推得", plan_mod.period_key("week", datetime(2026, 9, 30)) == "2026-W40")
 
+three_ok = {day: outcome(True) for day in week_days[:4]} | {week_days[4]: outcome(False)}
+week_info = progress_mod.rollup(config, PLAN_LAYER_WEEK, "2026-W40", three_ok)
+check("4/5 成功 → 这周算完成", week_info["complete"] and week_info["ok"] == 4 and week_info["judged"] == 5, str(week_info))
 
-plan_mod.store.save_plan = _fake_save_plan  # type: ignore[assignment]
-run(plan_mod.advance_progress({PLAN_LAYER_WEEK: roll_plan}, outcomes[:3]))
-check("评估结果写回计划文件（落盘）", saved_plans == ["2026-W41"], str(saved_plans))
+half = {day: outcome(index % 2 == 0) for index, day in enumerate(week_days[:4])}
+half_info = progress_mod.rollup(config, PLAN_LAYER_WEEK, "2026-W40", half)
+check("恰好 50% 不算完成（要「50% 以上」）", half_info["complete"] is False, str(half_info))
+
+empty_info = progress_mod.rollup(config, PLAN_LAYER_WEEK, "2026-W40", {})
+check("一天都没判定 → 不算完成", empty_info["judged"] == 0 and empty_info["complete"] is False)
+
+# 月 = 该月各周上卷；年 = 该年各月上卷
+month_outcomes = {}
+for day in range(1, 29):  # 2026-09：前四周全成功
+    month_outcomes[f"2026-09-{day:02d}"] = outcome(True)
+month_info = progress_mod.rollup(config, PLAN_LAYER_MONTH, "2026-09", month_outcomes)
+check("月由各周上卷", month_info["judged"] >= 4 and month_info["complete"], str(month_info))
+
+year_outcomes = {
+    f"2026-{month:02d}-{day:02d}": outcome(True)
+    for month in range(1, 7)
+    for day in range(1, 29)
+}
+year_info = progress_mod.rollup(config, PLAN_LAYER_YEAR, "2026", year_outcomes)
+check("年由各月上卷（上半年满，1-6 月都完成）", year_info["ok"] >= 5 and year_info["complete"], str(year_info))
+
+# 推进项完成度 = 盯过它的那些天里成功日占比 > 50%
+item_info = progress_mod.item_completion(
+    week_plan,
+    {
+        "2026-09-30": outcome(True),
+        "2026-10-01": outcome(True),
+        "2026-10-02": outcome(False),
+    },
+    {
+        "2026-09-30": "把课程论文写完",
+        "2026-10-01": "把课程论文写完",
+        "2026-10-02": "把课程论文写完",
+    },
+)
+first_item = item_info[0]
+check("2/3 成功 → 这条推进项算完成", first_item["complete"] and first_item["ok"] == 2, str(first_item))
+check(
+    "没人盯过的推进项不算完成",
+    item_info[1]["judged"] == 0 and item_info[1]["complete"] is False,
+    str(item_info[1]),
+)
+
+# 情绪：由最近几天的成功日比例推出
+mood_days = {"2026-09-28": outcome(True), "2026-09-29": outcome(True), "2026-09-30": outcome(True)}
+level, note = progress_mod.mood_of(config, mood_days, today=datetime(2026, 10, 1).date())
+check("连着顺 → good", level == "good", f"{level} {note}")
+level_bad, _ = progress_mod.mood_of(
+    config,
+    {"2026-09-28": outcome(False), "2026-09-29": outcome(False)},
+    today=datetime(2026, 9, 30).date(),
+)
+check("连着不顺 → bad", level_bad == "bad", level_bad)
+check("没有判定过的日子 → normal", progress_mod.mood_of(config, {}, today=datetime(2026, 9, 30).date())[0] == "normal")
 
 # 链条：缺哪层补哪层；三层都可生成时用 direct 各调一次；池子可用时不再调模型
 _chain_store: dict[tuple[str, str], PeriodPlan] = {}

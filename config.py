@@ -360,6 +360,56 @@ class DailyScheduleConfig(BaseConfig):
                 "开启后每轮多几十字，好处是她能直接聊起「这周在忙什么」。"
             ),
         )
+        announce_year: bool = Field(
+            default=True,
+            description=(
+                "新的一年（或首次装上）生成年目标时，是否主动分享给主人。\n"
+                "分享目标是「最近一次主人开口的会话」；没有已知会话时只记日志，"
+                "年目标随时可以用 /目标 查。"
+            ),
+        )
+
+    @config_section("progress")
+    class ProgressSection(SectionBase):
+        """完成度与情绪：判定只落在日程层，上层靠「下级 50% 上卷」。
+
+        主人定的口径：「每一级下一部分完成 50% 以上就算上一级完成，省去了判定完成的
+        token，只需要判定日程。」所以这里没有模型调用——日程层每天判一次（掷骰，
+        含忙碌等级与被打断的影响），周 / 月 / 年 / 推进项的完成度全是**算出来的**。
+        """
+
+        rollup_threshold: float = Field(
+            default=0.5,
+            description=(
+                "上卷阈值：下级完成比例**超过**这个值，上一级就算完成（默认 0.5）。\n"
+                "例：本周已判定的日子里成功日占比 > 50% → 这周算完成。"
+            ),
+        )
+        interrupt_penalty: float = Field(
+            default=0.2,
+            description=(
+                "忙时被打断（主人到场让位）每档扣多少成功概率。\n"
+                "较忙算 1 档、很忙算 2 档；空闲时被打断不扣。"
+            ),
+        )
+        idle_bonus: float = Field(
+            default=0.05,
+            description="一整天都没忙过（最忙的一档是空闲）时的加成：那天本来就没什么可耽误的。",
+        )
+        max_days: int = Field(
+            default=7,
+            description="一次补判定最多往前判几天，防止停机很久后一次性算一大堆。",
+        )
+        mood_days: int = Field(
+            default=3,
+            description="情绪看最近几天的成功日比例（顺 / 平常 / 有点背）。",
+        )
+        inject_mood: bool = Field(
+            default=False,
+            description=(
+                "是否把情绪也注入对话。**默认关**（省 token）：情绪先只用于日记与 ``/目标``。"
+            ),
+        )
 
     @config_section("scene")
     class SceneSection(SectionBase):
@@ -537,12 +587,12 @@ class DailyScheduleConfig(BaseConfig):
             ),
         )
         auto_enable_with_time_sense: bool = Field(
-            default=True,
+            default=False,
             description=(
                 "检测到 time_sense（时间感知插件）时，是否自动打开离线生活。\n"
-                "默认开启——装了时间插件就自动记离线日记，省得用户去翻配置。\n"
-                "自动开启只改**运行时**的配置值，不会回写这份 config.toml。\n"
-                "要让离线生活始终关闭，就把本项与 enabled 一起设为 false。"
+                "**默认 false：日记默认关闭**（主人定的口径）。装好 time_sense 只是让它\n"
+                "「可以」记日记，要不要花这份 token 由你决定——想开就把这一项与 enabled 一起设 true。\n"
+                "（v1.2.0 之前默认是 true，装上 time_sense 就自动开；从 1.2.0 起改成默认关。）"
             ),
         )
         min_seconds: int = Field(
@@ -645,6 +695,7 @@ class DailyScheduleConfig(BaseConfig):
     schedule: ScheduleSection = Field(default_factory=ScheduleSection)
     pool: PoolSection = Field(default_factory=PoolSection)
     plan: PlanSection = Field(default_factory=PlanSection)
+    progress: ProgressSection = Field(default_factory=ProgressSection)
     scene: SceneSection = Field(default_factory=SceneSection)
     log: LogSection = Field(default_factory=LogSection)
     offline: OfflineSection = Field(default_factory=OfflineSection)

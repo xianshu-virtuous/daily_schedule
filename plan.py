@@ -39,9 +39,8 @@
 from __future__ import annotations
 
 import hashlib
-import random
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from src.app.plugin_system.api.log_api import get_logger
@@ -56,14 +55,11 @@ from .models import (
     PLAN_LAYER_WEEK,
     PLAN_LAYER_YEAR,
     PLAN_LAYERS,
-    PLAN_PROGRESS_OK,
-    PLAN_PROGRESS_STUCK,
     PeriodPlan,
     PlanItem,
     PlanPool,
     period_expiry,
     period_key,
-    period_start,
     validate_period_plan,
 )
 from .persona import PersonaSnapshot, read_persona
@@ -817,74 +813,92 @@ async def load_current_chain(now: datetime | None = None) -> dict[str, PeriodPla
     return plans
 
 
-# ── 随机评估：对周常 / 月常掷骰 ───────────────────────────────────────────────
+# ── 完成度：判定只落在日程层，这里只负责把它接进规划 ─────────────────────────
+#
+# 主人定的口径：「每一级下一部分完成 50% 以上就算上一级完成，省去了判定完成的 token，
+# 只需要判定日程。」所以本模块**不做任何判定**——判定在 :mod:`progress`（日程层，
+# 一次掷骰、零模型调用），这里只把结果读出来给规划用：
+#
+# * 生成新一期规划时，把上一期的完成情况当「实际发生过的事」喂回去；
+# * 命令展示时显示各级完成度。
 
 
-def roll_progress(
+async def completion_snapshot(
     config: DailyScheduleConfig,
     plans: dict[str, PeriodPlan | None],
     *,
     moment: datetime,
-    rng: random.Random | None = None,
-) -> list[tuple[PlanItem, str]]:
-    """对「这周 / 这月正在推进的事」做一次随机评估。
-
-    规则来自主人定的口径：**八成成功（它高兴）、两成不成功（它失落）**。
-    评估对象是周程与月程里还没被评估过的推进项；结果会被写回计划文件，
-    所以同一条不会被反复掷——否则重启一次心情就换一次，人设自相矛盾。
+) -> dict[str, Any]:
+    """取当前三层的完成度（下级 50% 上卷，零模型调用）。
 
     Args:
         config: 插件配置。
-        plans: 各层计划。
+        plans: 三层计划。
         moment: 参考时间。
-        rng: 随机源（测试用；默认用系统随机）。
 
     Returns:
-        ``[(推进项, 结果)]``；没有可评估的项时返回空列表。
+        ``{层: 完成度}`` 加 ``items``（周程推进项各自的完成度）。
     """
-    if not bool(getattr(config.offline, "roll_enabled", True)):
-        return []
+    from . import progress as progress_module
 
-    rate = float(getattr(config.offline, "roll_success_rate", 0.8))
-    rate = max(0.0, min(1.0, rate))
-    source = rng or random.Random()
-    outcomes: list[tuple[PlanItem, str]] = []
-
-    for layer in (PLAN_LAYER_WEEK, PLAN_LAYER_MONTH):
+    outcomes = await store.day_outcomes()
+    snapshot: dict[str, Any] = {}
+    week_cache: dict[str, Any] = {}
+    for layer in PLAN_LAYERS:
         plan = plans.get(layer)
         if plan is None:
+            snapshot[layer] = {"judged": 0, "ok": 0, "ratio": 0.0, "complete": False, "unit": ""}
             continue
-        for item in plan.items:
-            if not item.is_open:
-                continue
-            result = PLAN_PROGRESS_OK if source.random() < rate else PLAN_PROGRESS_STUCK
-            item.progress = result
-            item.progress_at = moment.timestamp()
-            outcomes.append((item, result))
-    return outcomes
+        try:
+            snapshot[layer] = progress_module.rollup(
+                config, layer, plan.period, outcomes, week_cache=week_cache
+            )
+        except Exception as error:  # noqa: BLE001 - 完成度算不出来不该影响别的
+            logger.debug(f"[daily_schedule] 算 {layer} 完成度失败: {error}")
+            snapshot[layer] = {"judged": 0, "ok": 0, "ratio": 0.0, "complete": False, "unit": ""}
+
+    week = plans.get(PLAN_LAYER_WEEK)
+    if week is not None:
+        try:
+            week_days = [
+                (moment - timedelta(days=offset)).date().isoformat() for offset in range(0, 7)
+            ]
+            focus = await store.focus_by_day(week_days)
+            snapshot["items"] = progress_module.item_completion(
+                week,
+                outcomes,
+                focus,
+                threshold=float(getattr(config.progress, "rollup_threshold", 0.5)),
+            )
+        except Exception as error:  # noqa: BLE001 - 单项完成度失败不影响整体
+            logger.debug(f"[daily_schedule] 算推进项完成度失败: {error}")
+            snapshot["items"] = []
+    else:
+        snapshot["items"] = []
+    return snapshot
 
 
-def outcome_block(outcomes: list[tuple[PlanItem, str]]) -> str:
-    """把评估结果渲染成给日记缝合用的材料。"""
-    if not outcomes:
-        return ""
-    lines: list[str] = []
-    for item, result in outcomes:
-        mark = "顺利（事情推进了）" if result == PLAN_PROGRESS_OK else "不顺利（卡住了、没做成）"
-        lines.append(f"- {item.text}：{mark}")
-    return "\n".join(lines)
+def completion_line(info: dict[str, Any]) -> str:
+    """把一层完成度说成一句话。"""
+    judged = int(info.get("judged") or 0)
+    if not judged:
+        return "还没判定过"
+    mark = "已完成" if info.get("complete") else "未完成"
+    return f"{mark}（{info.get('ok')}/{judged} {info.get('unit') or ''}）"
 
 
 def summary_lines(
     plans: dict[str, PeriodPlan | None],
     *,
     pool_lines: dict[str, list[str]] | None = None,
+    completion: dict[str, Any] | None = None,
 ) -> list[str]:
     """把三层规划渲染成命令展示用的文本。
 
     Args:
         plans: 各层计划。
         pool_lines: 各层型池的附加说明。
+        completion: 各级完成度（见 :func:`completion_snapshot`）。
 
     Returns:
         文本行列表。
@@ -896,7 +910,11 @@ def summary_lines(
         if plan is None:
             lines.append(f"  {label}：还没有（下次生成时会补）")
         else:
-            lines.append(f"  {label}：{plan.text_block().splitlines()[0]}")
+            head = plan.text_block().splitlines()[0]
+            info = (completion or {}).get(layer)
+            if info:
+                head += f" ｜ {completion_line(info)}"
+            lines.append(f"  {label}：{head}")
             for extra in plan.text_block().splitlines()[1:]:
                 lines.append(f"  {extra}")
             expire = (
@@ -907,39 +925,24 @@ def summary_lines(
             lines.append(f"    （模式 {plan.mode}，到期 {expire}）")
         for extra in (pool_lines or {}).get(layer, []):
             lines.append(f"    {extra}")
+
+    for item in (completion or {}).get("items") or []:
+        flag = "✔" if item.get("complete") else "·"
+        lines.append(
+            f"    {flag} 本周推进：{item.get('text')}（{item.get('ok')}/{item.get('judged')} 天顺）"
+        )
     return lines
 
 
-async def advance_progress(
-    plans: dict[str, PeriodPlan | None],
-    outcomes: list[tuple[PlanItem, str]],
-) -> None:
-    """把评估结果写回计划文件（落盘，重启不丢）。
-
-    Args:
-        plans: 各层计划。
-        outcomes: 评估结果。
-    """
-    if not outcomes:
-        return
-    touched = {item.text for item, _ in outcomes}
-    for layer in (PLAN_LAYER_WEEK, PLAN_LAYER_MONTH):
-        plan = plans.get(layer)
-        if plan is None or not any(item.text in touched for item in plan.items):
-            continue
-        await store.save_plan(plan)
-
-
 __all__ = [
-    "advance_progress",
     "build_plan",
+    "completion_line",
+    "completion_snapshot",
     "compose_from_pool",
     "ensure_chain",
     "load_current_chain",
-    "outcome_block",
     "plan_block",
     "refresh_pool",
-    "roll_progress",
     "summary_lines",
     "today_focus",
     "upper_block",

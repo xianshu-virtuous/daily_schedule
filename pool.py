@@ -691,6 +691,7 @@ def compose_day(
         sources_used=["pool"],
         archetype=archetype.key,
         pool_id=pool.pool_id,
+        focus=focus_text,
     )
 
 

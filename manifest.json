@@ -32,6 +32,12 @@
       "component_name": "schedule",
       "dependencies": [],
       "enabled": true
+    },
+    {
+      "component_type": "command",
+      "component_name": "goal",
+      "dependencies": [],
+      "enabled": true
     }
   ],
   "entry_point": "plugin.py",

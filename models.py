@@ -192,6 +192,7 @@ class DailySchedule:
         sources_used: 本次生成实际用上的素材层（persona/memory/internet）。
         archetype: 这份日程来自哪个日型（池子模式才有；daily 模式为空）。
         pool_id: 来源池子的标识（池子模式才有）。
+        focus: 抽取这份日程时，周程点的「今天偏重」那件事；用于事后算这条推进项的完成度。
     """
 
     date: str
@@ -205,6 +206,7 @@ class DailySchedule:
     sources_used: list[str] = field(default_factory=list)
     archetype: str = ""
     pool_id: str = ""
+    focus: str = ""
 
     def entry_at(self, moment: datetime | time | str) -> ScheduleEntry | None:
         """取指定时刻所处的时段。
@@ -257,6 +259,7 @@ class DailySchedule:
             "sources_used": list(self.sources_used),
             "archetype": self.archetype,
             "pool_id": self.pool_id,
+            "focus": self.focus,
         }
 
     @classmethod
@@ -317,6 +320,7 @@ class DailySchedule:
             sources_used=sources,
             archetype=_coerce_text(raw.get("archetype"), 40),
             pool_id=_coerce_text(raw.get("pool_id"), 80),
+            focus=_coerce_text(raw.get("focus"), 80),
         )
 
 
@@ -1265,7 +1269,10 @@ class RuntimeState:
         yield_stream_id: 触发让位的聊天流 ID。
         yield_doing: 让位时原本在做的事。
         diary_inject_left: 日记还能注入几轮（每注入一次减一，减到 0 就不再发）。
-        last_roll_date: 最近做过随机评估的日期（``YYYY-MM-DD``，每天最多评估一次）。
+        last_roll_date: 最近做过日程判定的日期（``YYYY-MM-DD``，每天最多判一次）。
+        last_stream_id: 最近一次主人开口的会话（年目标主动分享用）。
+        mood: 情绪档（``good`` / ``normal`` / ``bad``，由最近几天的成功日比例推出）。
+        mood_note: 情绪的一句话说明。
         last_generate_at: 最近一次生成尝试的时间戳。
         last_error: 最近一次生成的错误摘要（排查用）。
     """
@@ -1277,6 +1284,9 @@ class RuntimeState:
     yield_doing: str = ""
     diary_inject_left: int = 0
     last_roll_date: str = ""
+    last_stream_id: str = ""
+    mood: str = ""
+    mood_note: str = ""
     last_generate_at: float = 0.0
     last_error: str = ""
 
@@ -1301,6 +1311,9 @@ class RuntimeState:
             "yield_doing": self.yield_doing,
             "diary_inject_left": self.diary_inject_left,
             "last_roll_date": self.last_roll_date,
+            "last_stream_id": self.last_stream_id,
+            "mood": self.mood,
+            "mood_note": self.mood_note,
             "last_generate_at": self.last_generate_at,
             "last_error": self.last_error,
         }
@@ -1332,6 +1345,9 @@ class RuntimeState:
             yield_doing=_coerce_text(raw.get("yield_doing"), 120),
             diary_inject_left=max(0, int(_number("diary_inject_left"))),
             last_roll_date=_coerce_text(raw.get("last_roll_date"), 10),
+            last_stream_id=_coerce_text(raw.get("last_stream_id"), 80),
+            mood=_coerce_text(raw.get("mood"), 16),
+            mood_note=_coerce_text(raw.get("mood_note"), 120),
             last_generate_at=_number("last_generate_at"),
             last_error=_coerce_text(raw.get("last_error"), 200),
         )

@@ -521,9 +521,56 @@ async def record_schedule_log(schedule: DailySchedule, *, log_enabled: bool = Tr
             "yesterday_summary": schedule.yesterday_summary,
             "archetype": schedule.archetype,
             "pool_id": schedule.pool_id,
+            "focus": schedule.focus,
             "events": events,
         },
     )
+
+
+async def append_log_interrupt(day: str, *, busy: int, doing: str = "", at: float = 0.0) -> None:
+    """往某天日志里追加一条**结构化**的「被打断」记录。
+
+    「被打断」＝主人到场让位。记结构化而不是只记一句话，是因为日程层的成功判定
+    要用它：在忙的时段被打断才扣成功概率，所以判定需要知道**当时的忙碌等级**。
+
+    Args:
+        day: ``YYYY-MM-DD``。
+        busy: 被打断时那个时段的忙碌等级（0/1/2）。
+        doing: 当时原本在做的事。
+        at: 发生时间戳，默认现在。
+    """
+    payload = await store.load_log(day)
+    if not isinstance(payload, dict):
+        payload = {"date": day}
+    interrupts = payload.get("interrupts")
+    if not isinstance(interrupts, list):
+        interrupts = []
+    interrupts.append(
+        {
+            "at": float(at or time.time()),
+            "busy": max(0, min(2, int(busy or 0))),
+            "doing": str(doing or "")[:120],
+        }
+    )
+    payload["interrupts"] = interrupts[-20:]
+    await store.save_log(day, payload)
+
+
+async def save_day_outcome(day: str, outcome: dict[str, Any]) -> None:
+    """把某天的成功判定写进当天日志（``outcome`` 字段）。
+
+    判定只落在日程层，上层（周 / 月 / 年 / 推进项）的完成度都由这里的结果
+    按「下级 50% 上卷」算出来——所以这一步是整个完成度体系唯一的写入点。
+
+    Args:
+        day: ``YYYY-MM-DD``。
+        outcome: ``progress.judge_day`` 的返回。
+    """
+    payload = await store.load_log(day)
+    if not isinstance(payload, dict):
+        payload = {"date": day}
+    payload["outcome"] = outcome
+    await store.save_log(day, payload)
 
 
 async def append_log_event(day: str, text: str) -> None:
@@ -566,8 +613,10 @@ async def _record_success() -> None:
 
 __all__ = [
     "append_log_event",
+    "append_log_interrupt",
     "ensure_persona_profile",
     "generate_daily_schedule",
     "profile_block",
     "record_schedule_log",
+    "save_day_outcome",
 ]
