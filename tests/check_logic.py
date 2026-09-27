@@ -343,6 +343,7 @@ handler_self = types.SimpleNamespace(plugin=fake_plugin)
 handler_self._sync_reminders = SceneInjectorHandler._sync_reminders.__get__(handler_self, SceneInjectorHandler)
 handler_self._get_service = lambda: svc
 handler_self._stream_id_of = SceneInjectorHandler._stream_id_of
+handler_self._is_cache_safe_template = SceneInjectorHandler._is_cache_safe_template
 
 
 def build_params(texts_base: str = "BASE", texts_stream: str = "") -> dict:
@@ -1008,7 +1009,60 @@ check("没有周程指引时按正常逻辑抽", plain is not None and plain.arc
 check("周程说「外面办事」→ 抽中外向日型", focused is not None and focused.archetype == "workday-out", getattr(focused, "archetype", None))
 check("抽取仍然不调模型（只做字符串匹配）", focused is not None and focused.pool_id == tagged_pool.pool_id)
 
-# ── 8. 汇总 ──────────────────────────────────────────────────────────────────
+# ── 8. 用量闸门：预算截断 / 统计有界 / 退避 / 注入落点 ────────────────────────
+section("8. 用量闸门：提示词预算、失败退避、注入落点安全")
+
+from daily_schedule import budget as budget_mod  # noqa: E402
+
+sections = [
+    ("人设", "人" * 200),
+    ("人设梳理", "梳" * 200),
+    ("关于它的记忆", "记" * 400),
+    ("联网查到的参考", "网" * 400),
+]
+fitted, notes = budget_mod.fit(sections, limit=1000, keep=("人设", "人设梳理"))
+check("预算超限会丢可牺牲的材料", "联网查到的参考" not in fitted and notes, str(notes))
+check("被保住的人设还在", "人" * 50 in fitted and "梳" * 50 in fitted)
+check("截断会留下说明（写日志用）", all("丢弃" in note or "截断" in note for note in notes), str(notes))
+
+small, small_notes = budget_mod.fit(sections, limit=100000, keep=("人设",))
+check("没超限就一个字都不动", small_notes == [] and "联网查到的参考" in small)
+check("拼装带上段名", "【人设】" in small and "【联网查到的参考】" in small)
+
+hard, hard_notes = budget_mod.fit([("人设", "人" * 5000)], limit=800, keep=("人设",))
+check("只剩不可丢的段、又超限时硬截断", "已按预算截断" in hard, str(hard_notes))
+
+check("退避曲线 60→120→240，封顶 1800", [budget_mod.backoff_seconds(n) for n in (1, 2, 3)] == [60, 120, 240])
+check("退避有封顶", budget_mod.backoff_seconds(20) == 1800, str(budget_mod.backoff_seconds(20)))
+check("没失败就不退避", budget_mod.backoff_seconds(0) == 0 and budget_mod.in_backoff(0, 0.0) == 0.0)
+check("刚失败时处在退避窗口里", budget_mod.in_backoff(1, time.time()) > 0)
+check("退避窗口过去后可以重试", budget_mod.in_backoff(1, time.time() - 3600) == 0.0)
+
+# 落点安全：只有 user prompt 模板能注入（注进 system 会顶掉前缀缓存）
+check(
+    "user prompt 模板允许注入",
+    SceneInjectorHandler._is_cache_safe_template("default_chatter_user_prompt")
+    and SceneInjectorHandler._is_cache_safe_template("neo_default_chatter_user_prompt"),
+)
+check(
+    "system prompt 模板被拒绝",
+    not SceneInjectorHandler._is_cache_safe_template("default_chatter_system_prompt")
+    and not SceneInjectorHandler._is_cache_safe_template("system_prompt"),
+)
+check("空模板名被拒绝", not SceneInjectorHandler._is_cache_safe_template(""))
+
+# 注入量统计：进程内计数（用来证明不随对话变长）
+budget_mod._inject_counters.update({"turns": 0, "chars": 0, "max_chars": 0, "since_flush": 0})
+for size in (100, 300, 200):
+    budget_mod.note_injection(size)
+snapshot = budget_mod.injection_snapshot()
+check(
+    "注入计数记轮数/合计/最大/平均",
+    snapshot["turns"] == 3 and snapshot["chars"] == 600 and snapshot["max_chars"] == 300 and snapshot["avg_chars"] == 200,
+    str(snapshot),
+)
+
+# ── 9. 汇总 ──────────────────────────────────────────────────────────────────
 section("结果")
 print(f"断言 {checks} 项，失败 {len(failures)} 项")
 if failures:

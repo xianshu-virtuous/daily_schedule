@@ -40,7 +40,7 @@ from typing import Any
 
 from src.app.plugin_system.api.log_api import get_logger
 
-from . import llm, sources, store
+from . import budget, llm, sources, store
 from .config import DailyScheduleConfig
 from .models import DailySchedule
 from .persona import read_persona
@@ -619,51 +619,69 @@ def _build_prompt(
         用户提示词。
     """
     seconds = _as_float(span.get("seconds"))
-    parts: list[str] = []
+    parts: list[tuple[str, str]] = []
 
     if persona_block:
-        parts.append("【人设】\n" + persona_block)
+        parts.append(("人设", persona_block))
 
     parts.append(
-        "【时间事实：真实发生，不可修改】\n"
-        f"它离开的时刻：{date_of(from_ts)} {clock_of(from_ts)}\n"
-        f"它回来的时刻：{date_of(to_ts)} {clock_of(to_ts)}\n"
-        f"中间隔了 {humanize_duration(seconds)}"
-        f"（time_sense 结算值 {span.get('text') or humanize_duration(seconds)}，"
-        f"跨 {int(_as_float(span.get('days')))} 个自然日）。\n"
-        "这段时间它不在线上，需要你补写它当时在做什么。"
+        (
+            "时间事实：真实发生，不可修改",
+            f"它离开的时刻：{date_of(from_ts)} {clock_of(from_ts)}\n"
+            f"它回来的时刻：{date_of(to_ts)} {clock_of(to_ts)}\n"
+            f"中间隔了 {humanize_duration(seconds)}"
+            f"（time_sense 结算值 {span.get('text') or humanize_duration(seconds)}，"
+            f"跨 {int(_as_float(span.get('days')))} 个自然日）。\n"
+            "这段时间它不在线上，需要你补写它当时在做什么。",
+        )
     )
 
     if plan_block:
-        parts.append("【它正在推进的事（年程 / 月程 / 周程）】\n" + plan_block)
+        parts.append(("它正在推进的事（年程 / 月程 / 周程）", plan_block))
 
     if outcome_lines:
         parts.append(
-            "【日程判定：真实发生，不可修改】\n"
-            + outcome_lines
-            + "\n这是按「那天最忙的一档 + 有没有在忙的时候被搭话打断」算出来的结果："
-            "算成了就写出一笔踏实或高兴，没算成要写出一点低落或不甘心——两种结果别写成同一种语气。"
-            "顺便提一嘴当时忙不忙、有没有被叫走。"
+            (
+                "日程判定：真实发生，不可修改",
+                outcome_lines
+                + "\n这是按「那天最忙的一档 + 有没有在忙的时候被搭话打断」算出来的结果："
+                "算成了就写出一笔踏实或高兴，没算成要写出一点低落或不甘心——两种结果别写成同一种语气。"
+                "顺便提一嘴当时忙不忙、有没有被叫走。",
+            )
         )
 
     if schedule_lines:
         parts.append(
-            "【它原本的安排（离开期间覆盖到的几段）】\n"
-            + "\n".join(f"- {line}" for line in schedule_lines)
+            ("它原本的安排（离开期间覆盖到的几段）", "\n".join(f"- {line}" for line in schedule_lines))
         )
 
     if memory_notes:
         parts.append(
-            "【关于它的记忆（可能有噪音，只取用得上的）】\n"
-            + "\n".join(f"- {note}" for note in memory_notes)
+            (
+                "关于它的记忆（可能有噪音，只取用得上的）",
+                "\n".join(f"- {note}" for note in memory_notes),
+            )
         )
 
     if history:
-        parts.append("【更早的日记（保持延续，不要重复已经写过的事）】\n" + history)
+        parts.append(("更早的日记（保持延续，不要重复已经写过的事）", history))
 
-    parts.append(f"【现在】{now.strftime('%Y-%m-%d %H:%M')}（本地时间）。")
-    parts.append("请按要求补写这段时间，并只输出 JSON。")
-    return "\n\n".join(parts)
+    parts.append(
+        (
+            "现在",
+            f"{now.strftime('%Y-%m-%d %H:%M')}（本地时间）。请按要求补写这段时间，并只输出 JSON。",
+        )
+    )
+
+    # 预算闸：时间事实、判定与本轮要求不许丢；更早的日记/记忆/日程材料按优先级丢
+    text, notes = budget.fit(
+        parts,
+        limit=int(getattr(config.budget, "max_prompt_chars", 12000)),
+        keep=("人设", "时间事实：真实发生，不可修改", "日程判定：真实发生，不可修改", "现在"),
+    )
+    for note in notes:
+        logger.warning(f"[daily_schedule] 日记提示词{note}")
+    return text
 
 
 async def compose(

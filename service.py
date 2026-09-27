@@ -43,7 +43,16 @@ from src.app.plugin_system.base import BaseService
 from src.app.plugin_system.types import PermissionLevel
 from src.kernel.concurrency import get_task_manager
 
-from . import diary, generator, plan as plan_module, pool as pool_module, progress as progress_module, scene, store
+from . import (
+    budget,
+    diary,
+    generator,
+    plan as plan_module,
+    pool as pool_module,
+    progress as progress_module,
+    scene,
+    store,
+)
 from .config import DailyScheduleConfig
 from .models import BUSY_LABELS, DailySchedule, RuntimeState
 from .persona import read_persona
@@ -903,6 +912,8 @@ class ScheduleService(BaseService):
         Returns:
             生成的日程；失败返回 ``None``。
         """
+        if await self._in_backoff():
+            return None
         try:
             snapshot = read_persona()
             if not snapshot.is_usable:
@@ -920,12 +931,68 @@ class ScheduleService(BaseService):
             )
         except Exception as error:  # noqa: BLE001 - 生成失败不应中断对话
             logger.error(f"[daily_schedule] 日程生成异常: {error}")
+            await self._note_generate_failure(str(error))
             return None
 
         if schedule is not None:
+            await self._note_generate_success()
             # 生成完就把「今天干什么」摊开写进日志，主人一眼能看到 bot 的一天
             await self.log_today(now=moment, prefix="生成完成 · ")
+        else:
+            await self._note_generate_failure("生成未成功")
         return schedule
+
+    # ── 失败退避（防止「失败就立刻重试」把 token 烧掉） ───────────────────────
+
+    async def _in_backoff(self) -> bool:
+        """当前是否处在失败退避窗口里。
+
+        事故形状：调用失败 → 下一个 tick 立刻重试 → 每 15~30 分钟烧一次模型调用，
+        一晚上几百次。所以连续失败要按 60→120→240…→1800 秒退避。
+
+        Returns:
+            还要继续等返回 True。
+        """
+        if not bool(getattr(self.config.budget, "fail_backoff", True)):
+            return False
+        state = await store.load_state()
+        streak = int(getattr(state, "gen_fail_streak", 0) or 0)
+        last_fail = float(getattr(state, "gen_last_fail_at", 0.0) or 0.0)
+        wait = budget.in_backoff(streak, last_fail)
+        if wait > 0:
+            logger.info(
+                f"[daily_schedule] 上次生成失败（连续 {streak} 次），"
+                f"退避中：还要等 {int(wait)}s 再试"
+            )
+            return True
+        return False
+
+    async def _note_generate_failure(self, reason: str) -> None:
+        """记一次失败：累加连续失败次数与时间戳（落盘，重启不丢）。"""
+        try:
+            state = await store.load_state()
+            state.gen_fail_streak = int(getattr(state, "gen_fail_streak", 0) or 0) + 1
+            state.gen_last_fail_at = time.time()
+            state.last_error = reason[:200]
+            await store.save_state(state)
+            logger.warning(
+                f"[daily_schedule] 生成失败第 {state.gen_fail_streak} 次，"
+                f"下次最早 {budget.backoff_seconds(state.gen_fail_streak)}s 后重试"
+            )
+        except Exception as error:  # noqa: BLE001 - 记账失败不影响别的
+            logger.debug(f"[daily_schedule] 记录失败次数失败: {error}")
+
+    async def _note_generate_success(self) -> None:
+        """成功一次就清掉失败计数（退避随之归零）。"""
+        try:
+            state = await store.load_state()
+            if int(getattr(state, "gen_fail_streak", 0) or 0) or state.last_error:
+                state.gen_fail_streak = 0
+                state.gen_last_fail_at = 0.0
+                state.last_error = ""
+                await store.save_state(state)
+        except Exception as error:  # noqa: BLE001 - 同上
+            logger.debug(f"[daily_schedule] 清理失败计数失败: {error}")
 
     # ── 日程概览（日志用） ────────────────────────────────────────────────────
 
@@ -1472,6 +1539,18 @@ class ScheduleService(BaseService):
             "mood_note": state.mood_note,
             "last_roll_date": state.last_roll_date,
         }
+
+    async def usage_lines(self) -> list[str]:
+        """取模型调用用量的展示文本（``/日程 用量``）。
+
+        会不会把 token 打爆不该靠猜：这里能看到每次调用的输入大小、今日合计、
+        最大单次，以及「每轮注入多少字符」——最后这个用来验证注入量是固定的、
+        不随对话变长。
+
+        Returns:
+            文本行列表。
+        """
+        return await budget.usage_lines(self.config)
 
     async def pool_lines(self) -> list[str]:
         """取池子状态的多行展示文本（命令用）。

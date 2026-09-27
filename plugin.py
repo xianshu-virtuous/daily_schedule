@@ -103,7 +103,7 @@ class DailySchedulePlugin(BasePlugin):
         "让 Bot 拥有自己的时间：三层规划（年程→月程→周程）定方向、日程池每日轮换抽取、"
         "主人来时只在触发会话让位；判定只落在日程层，完成度按下级 50% 上卷"
     )
-    plugin_version: str = "1.2.0"
+    plugin_version: str = "1.2.1"
     configs: list[type] = [DailyScheduleConfig]
 
     def __init__(self, config: Any = None) -> None:

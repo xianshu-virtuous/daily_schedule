@@ -45,7 +45,7 @@ from typing import Any
 
 from src.app.plugin_system.api.log_api import get_logger
 
-from . import generator, llm, sources, store
+from . import budget, generator, llm, sources, store
 from .config import DailyScheduleConfig
 from .models import (
     PLAN_KIND_BUSY,
@@ -240,40 +240,51 @@ async def _user_prompt(
     now: datetime,
 ) -> str:
     """拼出生成某一层规划的用户提示词（异步：要读实际发生过的事实）。"""
-    parts: list[str] = []
+    parts: list[tuple[str, str]] = []
 
     persona_block = bundle.persona_block or snapshot.to_prompt_block()
     if persona_block:
-        parts.append("【人设】\n" + persona_block)
+        parts.append(("人设", persona_block))
 
     profile_block = generator.profile_block(profile)
     if profile_block:
-        parts.append("【人设梳理】\n" + profile_block)
+        parts.append(("人设梳理", profile_block))
 
     memory_block = bundle.memory_block()
     if memory_block:
-        parts.append("【关于它的记忆（可能有噪音，只取用得上的）】\n" + memory_block)
+        parts.append(("关于它的记忆（可能有噪音，只取用得上的）", memory_block))
 
     upper = upper_block(plans, layer)
     if upper:
-        parts.append("【上层规划（这一层要围绕它展开）】\n" + upper)
+        parts.append(("上层规划（这一层要围绕它展开）", upper))
     else:
-        parts.append("【上层规划】\n（这是最上面一层，围绕人设与所在环境来写）")
+        parts.append(("上层规划", "（这是最上面一层，围绕人设与所在环境来写）"))
 
     # 事实优先：把实际发生过的事喂回去，纠正计划里的想当然
     history = await _recent_blocks(config, layer, now)
     if history:
-        parts.append("【实际发生过的（计划要跟它对齐，别装作没发生）】\n" + history)
+        parts.append(("实际发生过的（计划要跟它对齐，别装作没发生）", history))
 
     if mood_hint:
-        parts.append("【这一套的走向】" + mood_hint)
+        parts.append(("这一套的走向", mood_hint))
 
     parts.append(
-        f"【时间】现在 {now:%Y-%m-%d %H:%M}；这一层是"
-        f"{PLAN_LAYER_LABELS.get(layer, layer)}（{_KIND_HINT.get(layer, '')}）。"
-        "请按格式输出 JSON。"
+        (
+            "时间",
+            f"现在 {now:%Y-%m-%d %H:%M}；这一层是"
+            f"{PLAN_LAYER_LABELS.get(layer, layer)}"
+            f"（{_KIND_HINT.get(layer, '')}）。请按格式输出 JSON。",
+        )
     )
-    return "\n\n".join(parts)
+    # 预算闸：人设与时间要求不许丢，材料按优先级丢（超限会记一条 WARNING）
+    text, notes = budget.fit(
+        parts,
+        limit=int(getattr(config.budget, "max_prompt_chars", 12000)),
+        keep=("人设", "人设梳理", "时间"),
+    )
+    for note in notes:
+        logger.warning(f"[daily_schedule] {layer} 规划提示词{note}")
+    return text
 
 
 async def _recent_blocks(config: DailyScheduleConfig, layer: str, now: datetime) -> str:

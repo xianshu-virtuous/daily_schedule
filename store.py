@@ -113,6 +113,35 @@ async def _save_raw(name: str, data: dict[str, Any]) -> bool:
         return False
 
 
+async def load_json_raw(name: str) -> dict[str, Any] | None:
+    """读任意存储键的原始字典（用量统计这类"插件自己的小账本"用）。
+
+    与 :func:`_load_raw` 的区别：这个是**对外**的，别的模块不用再自己碰 ``_load_raw``。
+
+    Args:
+        name: 存储键名。
+
+    Returns:
+        数据字典，或 ``None``。
+    """
+    return await _load_raw(name)
+
+
+async def save_json_raw(name: str, data: dict[str, Any]) -> bool:
+    """写任意存储键。
+
+    Args:
+        name: 存储键名。
+        data: 待写入数据。
+
+    Returns:
+        是否写入成功。
+    """
+    if not isinstance(data, dict):
+        return False
+    return await _save_raw(name, data)
+
+
 async def load_schedule(date_str: str) -> DailySchedule | None:
     """读取某天的日程。
 
@@ -635,6 +664,7 @@ __all__ = [
     "diary_key",
     "focus_by_day",
     "load_diary",
+    "load_json_raw",
     "load_log",
     "load_logs",
     "load_persona_profile",
@@ -656,6 +686,7 @@ __all__ = [
     "recent_schedule_dates",
     "recent_schedules",
     "save_diary",
+    "save_json_raw",
     "save_log",
     "save_persona_profile",
     "save_plan",

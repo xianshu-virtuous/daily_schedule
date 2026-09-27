@@ -1270,6 +1270,8 @@ class RuntimeState:
         yield_doing: 让位时原本在做的事。
         diary_inject_left: 日记还能注入几轮（每注入一次减一，减到 0 就不再发）。
         last_roll_date: 最近做过日程判定的日期（``YYYY-MM-DD``，每天最多判一次）。
+        gen_fail_streak: 连续生成失败次数（失败退避用）。
+        gen_last_fail_at: 最近一次生成失败的时间戳。
         last_stream_id: 最近一次主人开口的会话（年目标主动分享用）。
         mood: 情绪档（``good`` / ``normal`` / ``bad``，由最近几天的成功日比例推出）。
         mood_note: 情绪的一句话说明。
@@ -1284,6 +1286,8 @@ class RuntimeState:
     yield_doing: str = ""
     diary_inject_left: int = 0
     last_roll_date: str = ""
+    gen_fail_streak: int = 0
+    gen_last_fail_at: float = 0.0
     last_stream_id: str = ""
     mood: str = ""
     mood_note: str = ""
@@ -1311,6 +1315,8 @@ class RuntimeState:
             "yield_doing": self.yield_doing,
             "diary_inject_left": self.diary_inject_left,
             "last_roll_date": self.last_roll_date,
+            "gen_fail_streak": self.gen_fail_streak,
+            "gen_last_fail_at": self.gen_last_fail_at,
             "last_stream_id": self.last_stream_id,
             "mood": self.mood,
             "mood_note": self.mood_note,
@@ -1345,6 +1351,8 @@ class RuntimeState:
             yield_doing=_coerce_text(raw.get("yield_doing"), 120),
             diary_inject_left=max(0, int(_number("diary_inject_left"))),
             last_roll_date=_coerce_text(raw.get("last_roll_date"), 10),
+            gen_fail_streak=max(0, int(_number("gen_fail_streak"))),
+            gen_last_fail_at=_number("gen_last_fail_at"),
             last_stream_id=_coerce_text(raw.get("last_stream_id"), 80),
             mood=_coerce_text(raw.get("mood"), 16),
             mood_note=_coerce_text(raw.get("mood_note"), 120),

@@ -19,7 +19,7 @@ from typing import Any
 
 from src.app.plugin_system.api.log_api import get_logger
 
-from . import diary, llm, sources, store
+from . import budget, diary, llm, sources, store
 from .config import DailyScheduleConfig
 from .models import (
     PERSONA_KIND_ORIGINAL,
@@ -244,44 +244,54 @@ def _build_user_prompt(
     Returns:
         用户提示词。
     """
-    parts: list[str] = []
+    parts: list[tuple[str, str]] = []
 
     persona_block = bundle.persona_block or snapshot.to_prompt_block()
     if persona_block:
-        parts.append("【人设】\n" + persona_block)
+        parts.append(("人设", persona_block))
 
     profile_lines = profile_block(profile)
     if profile_lines:
-        parts.append("【人设梳理】\n" + profile_lines)
+        parts.append(("人设梳理", profile_lines))
 
     if plan_block:
-        parts.append(
-            "【它的年程 / 月程 / 周程（今天要照着周程来安排）】\n" + plan_block
-        )
+        parts.append(("它的年程 / 月程 / 周程（今天要照着周程来安排）", plan_block))
 
     memory_block = bundle.memory_block()
     if memory_block:
-        parts.append("【关于它的记忆（可能有噪音，只取用得上的）】\n" + memory_block)
+        parts.append(("关于它的记忆（可能有噪音，只取用得上的）", memory_block))
 
     internet_block = bundle.internet_block()
     if internet_block:
-        parts.append("【联网查到的参考（只取与角色日常相关的信息）】\n" + internet_block)
+        parts.append(("联网查到的参考（只取与角色日常相关的信息）", internet_block))
 
     if history:
-        parts.append(
-            "【前几天的记录（已经用过的安排，今天要避开它们的骨架）】\n" + history
+        parts.append(("前几天的记录（已经用过的安排，今天要避开它们的骨架）", history))
+
+    parts.append(
+        (
+            "今天",
+            f"{now.strftime('%Y-%m-%d')}，现在是 {now.strftime('%H:%M')}（本地时间）。",
         )
-
-    parts.append(
-        f"【今天】{now.strftime('%Y-%m-%d')}，现在是 {now.strftime('%H:%M')}（本地时间）。"
     )
     parts.append(
-        f"请安排 {config.schedule.min_entries}-{config.schedule.max_entries} 条条目，"
-        "完整覆盖今天 00:00 到 23:59，并按格式输出 JSON。"
-        "记住：上面的前几天记录是**已经写过的**，今天的场地与事件至少一半要和它们不同。"
+        (
+            "格式",
+            f"请安排 {config.schedule.min_entries}-{config.schedule.max_entries} 条条目，"
+            "完整覆盖今天 00:00 到 23:59，并按格式输出 JSON。"
+            "记住：上面的前几天记录是**已经写过的**，今天的场地与事件至少一半要和它们不同。",
+        )
     )
 
-    return "\n\n".join(parts)
+    # 预算闸：人设与今天/格式要求不许丢；联网/记忆/历史材料按优先级丢
+    text, notes = budget.fit(
+        parts,
+        limit=int(getattr(config.budget, "max_prompt_chars", 12000)),
+        keep=("人设", "人设梳理", "今天", "格式"),
+    )
+    for note in notes:
+        logger.warning(f"[daily_schedule] 日程生成提示词{note}")
+    return text
 
 
 def _parse_schedule(

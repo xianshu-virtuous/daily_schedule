@@ -74,6 +74,26 @@ class SceneInjectorHandler(BaseEventHandler):
         return None
 
     @staticmethod
+    def _is_cache_safe_template(template_name: str) -> bool:
+        """这个模板名能不能安全注入（只允许 user prompt 模板）。
+
+        为什么卡这一条：注入内容一律落在**最新一条 user 消息**里，而那条消息本来每轮
+        都是新的，所以前面的 system prompt 与全部历史仍在缓存上。要是注进 system prompt
+        或别的固定位置，一改就把后面的整段上下文挤掉缓存——那正是「十几万无缓存输入」
+        那个事故的形状。名字里出现 system 的一律拒绝。
+
+        Args:
+            template_name: 模板名。
+
+        Returns:
+            可以注入返回 True。
+        """
+        lowered = str(template_name or "").lower()
+        if not lowered or "system" in lowered:
+            return False
+        return lowered.endswith("_user_prompt") or "user_prompt" in lowered
+
+    @staticmethod
     def _stream_id_of(values: Any) -> str:
         """从模板变量里取当前会话 ID。
 
@@ -112,6 +132,13 @@ class SceneInjectorHandler(BaseEventHandler):
         targets = [str(item) for item in config.plugin.target_prompts]
         if template_name not in targets:
             return EventDecision.SUCCESS, params
+        if not self._is_cache_safe_template(template_name):
+            # 写进 system prompt / 首条 user 的注入会顶掉前缀缓存，绝不能干
+            logger.warning(
+                f"[daily_schedule] 拒绝往 {template_name} 注入："
+                "只有 user prompt 模板是安全的（注入在最新一轮，不进前缀缓存）"
+            )
+            return EventDecision.SUCCESS, params
 
         service = self._get_service()
         if service is None:
@@ -145,6 +172,13 @@ class SceneInjectorHandler(BaseEventHandler):
             injection = texts.full
             existing = str(values.get("extra", ""))
             values["extra"] = (existing + "\n" + injection) if existing else injection
+
+        # 记一笔「这轮注入多少字符」：用它证明注入量是固定的、不随对话变长
+        if bool(getattr(config.budget, "note_injection", True)):
+            from .. import budget
+
+            budget.note_injection(len(texts.full))
+            await budget.maybe_flush_injection()
 
         if config.plugin.debug_log:
             logger.info(
