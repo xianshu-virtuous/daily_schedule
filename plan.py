@@ -399,15 +399,26 @@ async def build_plan(
         )
         return None, result.model_tag, ["无法解析 JSON"]
 
-    plan = PeriodPlan.from_dict({**payload, "layer": layer})
+    # 时期标识由**程序**按日期算，不依赖模型输出：三层提示词里并没有要求
+    # 模型给 period（它也不该知道「这一期」在系统里怎么编号），而
+    # ``PeriodPlan.from_dict`` 要求 period 非空、否则判为结构不完整。
+    # 以前这里只补了 layer，于是年/月/周三层的直生成与编型**必然**全部失败
+    # （池子也编不出来，因为编型同样走这条路径），链条断在这里。
+    period = period_key(layer, now)
+    plan = PeriodPlan.from_dict({**payload, "layer": layer, "period": period})
     if plan is None:
         return None, result.model_tag, ["结构不完整"]
 
     plan.layer = layer
+    plan.period = period
     plan.mode = "direct"
     plan.model_tag = result.model_tag
     plan.persona_fingerprint = snapshot.fingerprint
     plan.source = ",".join(bundle.used) or "persona"
+    plan.created_at = plan.created_at or time.time()
+    # 自然边界到期：与 compose_from_pool 抽出来的模板保持一致，
+    # 不补的话 expires_at=0 会让 is_expired() 永远为假。
+    plan.expires_at = plan.expires_at or period_expiry(layer, now)
     problems = validate_period_plan(plan, min_items=max(1, int(config.plan.min_items)))
     if problems:
         await store.save_raw_failure(

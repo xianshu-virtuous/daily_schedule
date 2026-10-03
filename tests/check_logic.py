@@ -962,6 +962,11 @@ plan_mod.store.save_plan_pool = _fake_save_plan_pool  # type: ignore[assignment]
 plan_mod.store.delete_plan_pool_staging = _fake_delete_plan_pool_staging  # type: ignore[assignment]
 plan_mod.generator.ensure_persona_profile = _fake_ensure_profile  # type: ignore[assignment]
 plan_mod.read_persona = lambda: PersonaSnapshot(nickname="测试角色", identity="学生", fingerprint="chainfp")  # type: ignore[assignment]
+# 真身留一份：第 6b 段要**不经过桩**地验证 build_plan 自己。
+# 之前这里直接把它换掉，真实的「抠 JSON → 补字段 → 校验」路径从未被执行，
+# 于是「提示词不要求 period、解析却强制要 period」这个必崩 bug 在 207 项
+# 全绿的情况下溜了过去。
+_real_build_plan = plan_mod.build_plan
 plan_mod.build_plan = _make_built("stub")  # type: ignore[assignment]
 
 chain_config = DailyScheduleConfig()
@@ -982,6 +987,91 @@ chain_config.plan.enabled = False
 disabled = run(plan_mod.ensure_chain(chain_config, None, now=MONDAY))
 check("关掉规划层后三层都为空", all(item is None for item in disabled.values()))
 chain_config.plan.enabled = True
+
+# ── 6b. build_plan 真实路径：时期标识由程序补齐，不依赖模型 ──────────────────
+section("6b. build_plan 真实路径（模型不给 period 也必须成功）")
+
+from daily_schedule.llm import LLMCallResult  # noqa: E402
+from daily_schedule.models import PersonaProfile  # noqa: E402
+from daily_schedule.sources import SourceBundle  # noqa: E402
+
+# 这一份 JSON **刻意不含 period**：三层提示词的输出格式里本来就没有这个字段，
+# 真实模型就是这样回的。修好 plan.build_plan 之前，它会被判「结构不完整」。
+_NO_PERIOD_JSON = (
+    '{"title":"推进周","mood":"前半周赶课，后半周松下来","kind":"busy",'
+    '"items":[{"text":"复习高数","why":"期末要考","kind":"work"}],"note":""}'
+)
+# 模型万一自己编一个 period，也不能让它说了算。
+_WRONG_PERIOD_JSON = (
+    '{"period":"1999-01","title":"推进周","mood":"前半周赶课","kind":"busy",'
+    '"items":[{"text":"复习高数","why":"期末要考","kind":"work"}],"note":""}'
+)
+
+_real_llm_call = plan_mod.llm.call
+_response_text = {"value": _NO_PERIOD_JSON}
+
+
+async def _fake_llm_call(config, system, user, **kwargs):
+    return LLMCallResult(ok=True, text=_response_text["value"], model_tag="fake-model")
+
+
+plan_mod.llm.call = _fake_llm_call  # type: ignore[assignment]
+
+_real_bundle = SourceBundle(persona_block="测试人设", used=["persona"])
+_real_snapshot = PersonaSnapshot(nickname="测试角色", identity="学生", fingerprint="realfp")
+_real_profile = PersonaProfile(character_name="测试角色", occupation="学生")
+
+for _layer, _want in (
+    (PLAN_LAYER_YEAR, "2026"),
+    (PLAN_LAYER_MONTH, "2026-09"),
+    (PLAN_LAYER_WEEK, "2026-W40"),
+):
+    _built, _tag, _problems = run(
+        _real_build_plan(
+            chain_config,
+            _real_snapshot,
+            _real_profile,
+            {},
+            _layer,
+            bundle=_real_bundle,
+            now=MONDAY,
+        )
+    )
+    check(
+        f"真实 build_plan：{_layer} 模型不给 period 也能成功",
+        _built is not None,
+        str(_problems),
+    )
+    check(
+        f"真实 build_plan：{_layer} 时期标识补齐 = {_want}",
+        getattr(_built, "period", "") == _want,
+        repr(getattr(_built, "period", "")),
+    )
+    check(
+        f"真实 build_plan：{_layer} period == period_key()",
+        getattr(_built, "period", "") == period_key(_layer, MONDAY),
+        repr(getattr(_built, "period", "")),
+    )
+    check(
+        f"真实 build_plan：{_layer} 到期落在自然边界（不再恒为 0）",
+        getattr(_built, "expires_at", 0.0) == period_expiry(_layer, MONDAY),
+        str(getattr(_built, "expires_at", 0.0)),
+    )
+
+_response_text["value"] = _WRONG_PERIOD_JSON
+_overridden, _, _ = run(
+    _real_build_plan(
+        chain_config, _real_snapshot, _real_profile, {}, PLAN_LAYER_WEEK,
+        bundle=_real_bundle, now=MONDAY,
+    )
+)
+check(
+    "真实 build_plan：模型自编的 period 被程序权威值覆盖",
+    getattr(_overridden, "period", "") == "2026-W40",
+    repr(getattr(_overridden, "period", "")),
+)
+
+plan_mod.llm.call = _real_llm_call  # type: ignore[assignment]
 
 # ── 7. 周程 → 日程：命中标签优先 ─────────────────────────────────────────────
 section("7. 周程指导日程：标签匹配优先，零额外调用")
@@ -1061,6 +1151,41 @@ check(
     snapshot["turns"] == 3 and snapshot["chars"] == 600 and snapshot["max_chars"] == 300 and snapshot["avg_chars"] == 200,
     str(snapshot),
 )
+
+# ── 8b. 日程覆盖校验：半截日程不许冒充一整天 ─────────────────────────────────
+section("8b. 日程覆盖校验（截断的半截日程不算一天）")
+
+from daily_schedule.generator import _covers_full_day  # noqa: E402
+
+
+def _spans(*pairs):
+    return [ScheduleEntry(start=s, end=e, doing="在做一件事") for s, e in pairs]
+
+
+check(
+    "完整一天（00:00 → 23:59）→ 通过",
+    _covers_full_day(_spans(("00:00", "12:00"), ("12:00", "23:59"))),
+)
+check(
+    "末段只到 17:20 → 拒绝（截断后常见的半截形状）",
+    not _covers_full_day(_spans(("00:00", "12:00"), ("12:00", "17:20"))),
+)
+check(
+    "只到 13:30 的 6 条 → 拒绝（段数够多，但没排完全天）",
+    not _covers_full_day(
+        _spans(
+            ("00:00", "01:20"),
+            ("01:20", "07:20"),
+            ("07:20", "08:30"),
+            ("08:30", "10:00"),
+            ("10:00", "12:10"),
+            ("12:10", "13:30"),
+        )
+    ),
+)
+check("首段不从 00:00 → 拒绝", not _covers_full_day(_spans(("06:00", "23:59"))))
+check("空列表 → 拒绝", not _covers_full_day([]))
+check("末段写 24:00 也认", _covers_full_day(_spans(("00:00", "24:00"))))
 
 # ── 9. 汇总 ──────────────────────────────────────────────────────────────────
 section("结果")

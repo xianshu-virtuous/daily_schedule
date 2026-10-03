@@ -294,6 +294,25 @@ def _build_user_prompt(
     return text
 
 
+def _covers_full_day(entries: list[ScheduleEntry]) -> bool:
+    """这批条目是否真的排满了一整天。
+
+    与池子路径的 ``models.validate_archetype`` 用同一套口径：首段从 00:00 开始、
+    末段到 23:59 结束。
+
+    Args:
+        entries: 已按 start 排序的日程条目。
+
+    Returns:
+        ``True`` 表示这一天在时间上是完整的。
+    """
+    if not entries:
+        return False
+    if entries[0].start != "00:00":
+        return False
+    return entries[-1].end in ("23:59", "24:00")
+
+
 def _parse_schedule(
     payload: dict[str, Any],
     *,
@@ -472,6 +491,30 @@ async def generate_daily_schedule(
         logger.warning(
             f"[daily_schedule] 日程生成失败：条目仅 {len(entries)} 条，"
             f"低于下限 {config.schedule.min_entries}"
+        )
+        return None
+
+    # 覆盖校验：条目够多 ≠ 这一天排完了。
+    # 模型输出被 max_tokens 截断时，``llm._recover_truncated`` 会把能配平的半截
+    # JSON 救回来（本意是「宁可少几条，也别整天没有日程」），于是**只排到下午的
+    # 日程**也能穿过上面的条数闸门被当成完整的一天落盘——条数够多不等于这一天
+    # 排完了（下限值与「一天该有多少段」本来就是两回事）。
+    # 覆盖判据与池子路径的 ``validate_archetype`` 对齐；不完整就按失败处理，
+    # 交给既有的退避重试再要一份，不让半截日程冒充一整天。
+    if not _covers_full_day(entries):
+        await store.save_raw_failure(
+            result.text,
+            model_tag=result.model_tag,
+            error=(
+                f"incomplete day: {entries[0].start}~{entries[-1].end}"
+                f" / {len(entries)} 条"
+            ),
+        )
+        await _record_failure("未覆盖全天")
+        logger.warning(
+            f"[daily_schedule] 日程生成失败：只覆盖 "
+            f"{entries[0].start}~{entries[-1].end}（{len(entries)} 条），"
+            "未排满 00:00-23:59——输出多半被截断，稍后重试"
         )
         return None
 
