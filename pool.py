@@ -64,7 +64,9 @@ from .persona import PersonaSnapshot, read_persona
 
 logger = get_logger("daily_schedule.pool")
 
-#: 编日型时的系统提示词。``{...}`` 占位符由 :func:`_system_prompt` 填。
+#: 编日型时的系统提示词。``{...}`` 占位符由 :func:`_system_prompt` 用
+#: ``str.replace`` 填——**不要改成 ``str.format``**：正文里带着一份完整的 JSON
+#: 输出示例，``format`` 会把示例开头的 ``{"name": ...}`` 当成占位符去查表。
 _ARCHETYPE_SYSTEM = """\
 你在为一个虚拟角色编「日型」——也就是它会反复过的一种日子。你写的是**模板**，不是某一天的流水账。
 
@@ -228,16 +230,34 @@ def pool_is_usable(
 
 
 def _system_prompt(config: DailyScheduleConfig, *, kind: str, existing: list[str]) -> str:
-    """按配置与已有日型拼出系统提示词。"""
-    pool = config.pool
-    return _ARCHETYPE_SYSTEM.format(
-        min_entries=max(2, int(config.schedule.min_entries)),
-        max_entries=max(2, int(config.schedule.max_entries)),
-        want_variants=max(2, min(4, int(pool.variants_per_slot))),
-        kind_label=_KIND_LABELS.get(kind, "工作日"),
-        kind_hint=_KIND_HINTS.get(kind, _KIND_HINTS[ARCHETYPE_WORKDAY]),
-        existing="、".join(existing) if existing else "（还没有，这是第一套）",
-    )
+    """按配置与已有日型拼出系统提示词。
+
+    这里刻意用 ``str.replace`` 而不是 ``str.format``：``_ARCHETYPE_SYSTEM`` 正文里
+    带着一份完整的 JSON 输出示例，``str.format`` 会把示例开头的 ``{"name": ...}``
+    当成占位符名去查表，抛 ``KeyError('\\n  "name"')``——刷池因此 100% 失败
+    （进循环第一次拼提示词就炸，日志里只剩一句 ``刷池失败: '\\n  "name"'``）。
+    占位符是固定几个，逐个替换最稳，以后再往模板里加 JSON 示例也不会踩。
+
+    Args:
+        config: 插件配置。
+        kind: ``workday`` / ``weekend``。
+        existing: 已编好的日型名（让模型避开同类）。
+
+    Returns:
+        填好占位符的系统提示词。
+    """
+    values = {
+        "{min_entries}": str(max(2, int(config.schedule.min_entries))),
+        "{max_entries}": str(max(2, int(config.schedule.max_entries))),
+        "{want_variants}": str(max(2, min(4, int(config.pool.variants_per_slot)))),
+        "{kind_label}": _KIND_LABELS.get(kind, "工作日"),
+        "{kind_hint}": _KIND_HINTS.get(kind, _KIND_HINTS[ARCHETYPE_WORKDAY]),
+        "{existing}": "、".join(existing) if existing else "（还没有，这是第一套）",
+    }
+    text = _ARCHETYPE_SYSTEM
+    for placeholder, value in values.items():
+        text = text.replace(placeholder, value)
+    return text
 
 
 def _user_prompt(

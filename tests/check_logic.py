@@ -619,6 +619,58 @@ pool_config.pool.weekend_archetypes = 0
 pool_config.pool.retry_times = 0
 pool_config.pool.min_archetypes = 2
 
+# 回归：日型系统提示词的正文里带着一份完整的 JSON 输出示例。拼提示词必须用
+# 逐字 ``str.replace``，一旦改回 ``str.format``，示例开头的 ``{"name": ...}`` 就会被
+# 当成占位符名，抛 ``KeyError('\n  "name"')``——真机表现是刷池 100% 失败，日志里
+# 只剩一句「刷池失败: '\n  "name"'」，池子永远编不出来（下面 refresh_pool 的用例
+# 把 build_archetype 换成了假的，所以那条路走不到这里，必须单独钉）。
+try:
+    system_prompt = pool_mod._system_prompt(
+        pool_config, kind=ARCHETYPE_WORKDAY, existing=[]
+    )
+    prompt_error = ""
+except Exception as error:  # noqa: BLE001 - 自检里要报 FAIL 而不是崩掉
+    system_prompt, prompt_error = "", f"{type(error).__name__}: {error}"
+
+check(
+    "日型系统提示词能拼出来（模板里带 JSON 示例也不炸）",
+    not prompt_error and "输出格式" in system_prompt and '"name"' in system_prompt,
+    prompt_error or system_prompt[:80],
+)
+check(
+    "模板占位符全部被替换，没有残留的 {xxx}",
+    not any(
+        token in system_prompt
+        for token in (
+            "{min_entries}",
+            "{max_entries}",
+            "{want_variants}",
+            "{kind_label}",
+            "{kind_hint}",
+            "{existing}",
+        )
+    ),
+    prompt_error or system_prompt[:120],
+)
+check(
+    "已有日型名会写进「已经编过的日型」那句",
+    "训练日、闲散日"
+    in pool_mod._system_prompt(
+        pool_config, kind=ARCHETYPE_WORKDAY, existing=["训练日", "闲散日"]
+    ),
+)
+check(
+    "休息日也能拼（拿得到 weekend 的提示词）",
+    "休息日" in pool_mod._system_prompt(
+        pool_config, kind=ARCHETYPE_WEEKEND, existing=[]
+    ),
+)
+
+
+# 下面这段会把 build_archetype 换成假的（只测池子编排），先留一份真身的引用，
+# 给 5b 段的「真实路径」用例用。
+_real_build_archetype = pool_mod.build_archetype
+
 
 async def _failing_build(*args, **kwargs):
     return None, "fake-model", ["时段太少"], []
@@ -643,6 +695,123 @@ check("编够了就替换池子", refreshed is not None and _mem["current"] is r
 check("新池子带上了有效期", refreshed is not None and refreshed.refresh_at > MONDAY.timestamp())
 check("新池子带上了心声与指纹", refreshed is not None and refreshed.yield_lines == ["我先把刀放下。"] and refreshed.persona_fingerprint == "newfprint")
 check("替换后清掉半成品", _mem["staging"] is None)
+
+# ── 5b. build_archetype 真实路径：提示词里带着 JSON 示例也必须能编出日型 ──────
+section("5b. build_archetype 真实路径（只 fake 模型返回，整条链路都得通）")
+
+import json as _json  # noqa: E402
+
+from daily_schedule.llm import LLMCallResult  # noqa: E402
+from daily_schedule.models import PersonaProfile  # noqa: E402
+from daily_schedule.sources import SourceBundle  # noqa: E402
+
+
+def _slots_json(count: int = 13, variants: int = 3) -> str:
+    """造一份合规的日型 JSON（完整覆盖 00:00-23:59，模拟真实模型的正常输出）。"""
+    span = 24 * 60 // count
+    slots = []
+    for index in range(count):
+        begin = index * span
+        end = 24 * 60 - 1 if index == count - 1 else (index + 1) * span
+        slots.append(
+            {
+                "start": f"{begin // 60:02d}:{begin % 60:02d}",
+                "end": f"{end // 60:02d}:{end % 60:02d}",
+                "variants": [
+                    {
+                        "doing": f"真实路径测试动作{index}-{n}",
+                        "busy": n % 3,
+                        "hint": "",
+                    }
+                    for n in range(variants)
+                ],
+            }
+        )
+    return _json.dumps(
+        {
+            "name": "测试日型",
+            "mood": "测试基调",
+            "tags": ["训练", "外出"],
+            "slots": slots,
+            "yield_lines": ["我先把刀放下。", "我想先陪你一会儿。"],
+        },
+        ensure_ascii=False,
+    )
+
+
+# 还原真身：上面为了测池子编排把它换成了假的
+pool_mod.build_archetype = _real_build_archetype  # type: ignore[assignment]
+
+_real_pool_llm_call = pool_mod.llm.call
+_pool_seen = {"system": "", "user": ""}
+
+
+async def _fake_pool_llm_call(config, system, user, **kwargs):
+    """只拦模型调用，把真实拼出来的提示词留证。"""
+    _pool_seen["system"] = system
+    _pool_seen["user"] = user
+    return LLMCallResult(ok=True, text=_slots_json(), model_tag="fake-model")
+
+
+pool_mod.llm.call = _fake_pool_llm_call  # type: ignore[assignment]
+
+_real_pool_config = DailyScheduleConfig()
+_real_pool_config.schedule.min_entries = 6
+_real_pool_config.schedule.max_entries = 14
+_real_pool_config.pool.variants_per_slot = 3
+# 这里必须用真的 PersonaProfile：上面那个 fake_profile 是 SimpleNamespace，
+# 走不到 generator.profile_block（它要 is_roleplay），只能糊弄被 monkeypatch 的路径。
+_real_pool_profile = PersonaProfile(character_name="测试角色", occupation="学生")
+
+try:
+    _real_archetype, _real_tag, _real_problems, _real_lines = run(
+        pool_mod.build_archetype(
+            _real_pool_config,
+            fake_snapshot,
+            _real_pool_profile,
+            SourceBundle(persona_block="测试人设", used=["persona"]),
+            kind=ARCHETYPE_WORKDAY,
+            existing=[],
+            now=MONDAY,
+        )
+    )
+    _real_error = ""
+except Exception as error:  # noqa: BLE001 - 自检里要报 FAIL 而不是崩掉
+    _real_archetype, _real_problems, _real_lines = None, [], []
+    _real_error = f"{type(error).__name__}: {error}"
+
+check(
+    "真实 build_archetype：能编出日型（提示词拼装不炸；旧写法会抛 KeyError）",
+    _real_error == "" and _real_archetype is not None,
+    _real_error or str(_real_problems),
+)
+check(
+    "真实 build_archetype：编出的日型通过机械校验",
+    _real_error == "" and _real_problems == [],
+    _real_error or str(_real_problems),
+)
+check(
+    "真实 build_archetype：模型收到的系统提示词无残留占位符",
+    not any(
+        token in _pool_seen["system"]
+        for token in (
+            "{min_entries}",
+            "{max_entries}",
+            "{want_variants}",
+            "{kind_label}",
+            "{kind_hint}",
+            "{existing}",
+        )
+    ),
+    _pool_seen["system"][:120],
+)
+check(
+    "真实 build_archetype：JSON 输出示例被原样保留在提示词里",
+    '"name"' in _pool_seen["system"] and "yield_lines" in _pool_seen["system"],
+    _pool_seen["system"][-160:],
+)
+
+pool_mod.llm.call = _real_pool_llm_call  # type: ignore[assignment]
 
 # ── 6. 三层规划：周期边界 / 校验 / 型池填充 / 随机评估 / 链条 ──────────────────
 section("6. 三层规划：年程 → 月程 → 周程")
