@@ -380,12 +380,28 @@ async def build_archetype(
     payload = llm.extract_json(result.text)
     if payload is None:
         await store.save_raw_failure(
-            result.text, model_tag=result.model_tag, error="pool: unparsable json"
+            result.text,
+            model_tag=result.model_tag,
+            error="pool: unparsable json",
+            slot="pool",
         )
         return None, result.model_tag, ["无法解析 JSON"], []
 
     archetype = Archetype.from_dict({**payload, "kind": kind})
     if archetype is None:
+        # 这里以前不留档，于是「结构不完整」在日志里只是一句话，看不到模型到底
+        # 写了什么结构（slots 键名不对？slots 不是数组？还是抽错了片段）——
+        # 补上现场，并带上解析到的顶层键名，省得下次还要靠猜。
+        await store.save_raw_failure(
+            result.text,
+            model_tag=result.model_tag,
+            error=(
+                "pool: 结构不完整（缺少 slots 或变体），"
+                f"payload 顶层键={sorted(payload.keys())[:12]}，"
+                f"slots 类型={type(payload.get('slots')).__name__}"
+            ),
+            slot="pool",
+        )
         return None, result.model_tag, ["结构不完整（缺少 slots 或变体）"], []
 
     problems = validate_archetype(
@@ -397,7 +413,10 @@ async def build_archetype(
     lines = _unique_lines(payload.get("yield_lines"))
     if problems:
         await store.save_raw_failure(
-            result.text, model_tag=result.model_tag, error="pool: " + "；".join(problems[:3])
+            result.text,
+            model_tag=result.model_tag,
+            error="pool: " + "；".join(problems[:3]),
+            slot="pool",
         )
         return None, result.model_tag, problems, lines
 

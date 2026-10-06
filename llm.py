@@ -245,8 +245,15 @@ def _loosen(text: str) -> str:
 def _recover_truncated(text: str) -> str | None:
     """输出被 max_tokens 截断时的补救：退回最后一个完整位置的括号闭合。
 
-    从尾部往前试若干刀，每次都把括号补齐再解析；只要 ``entries`` 里
-    至少有一条可用条目就算救回来了（宁可少几条，也别整天没有日程）。
+    从尾部往前试若干刀，每次都把括号补齐再解析；只要配平后的结果认得出来是本
+    插件要的那份数据（:func:`_looks_like_payload`）就算救回来了（宁可少几条，
+    也别整天没有日程）。
+
+    判据用 ``_looks_like_payload`` 而**不是**写死 ``entries``：日型（``slots``）
+    被截断时同样该救。写死 entries 会让它永远救不回来，于是退化成
+    ``_iter_balanced_objects`` 找到的内部小对象（一个 slot），``Archetype.from_dict``
+    抠不到 slots，最后报「结构不完整（缺少 slots 或变体）」——连反馈给模型的话
+    都从「只覆盖到 16:00」退化成了一句没用的「结构不完整」。
     """
     start = text.find("{")
     if start == -1:
@@ -265,13 +272,21 @@ def _recover_truncated(text: str) -> str | None:
             parsed = json.loads(_loosen(closed))
         except (ValueError, TypeError):
             continue
-        if isinstance(parsed, dict) and parsed.get("entries"):
+        if isinstance(parsed, dict) and _looks_like_payload(parsed):
             return closed
     return None
 
 
 #: 认得出这是「本插件要的 JSON」的键名。
-_PAYLOAD_KEYS = ("entries", "yield_lines", "yesterday_summary", "kind", "character_name")
+#: ``slots`` 是日型（日程池）的骨干，必须在内——否则被截断时救不回来。
+_PAYLOAD_KEYS = (
+    "entries",
+    "slots",
+    "yield_lines",
+    "yesterday_summary",
+    "kind",
+    "character_name",
+)
 
 
 def _looks_like_payload(payload: dict[str, Any]) -> bool:

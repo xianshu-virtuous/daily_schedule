@@ -813,6 +813,124 @@ check(
 
 pool_mod.llm.call = _real_pool_llm_call  # type: ignore[assignment]
 
+# ── 5c. 「结构不完整」也必须留现场（以前的诊断盲区）───────────────────────────
+section("5c. 日型结构不完整时留下现场")
+
+from daily_schedule import store as store_mod  # noqa: E402
+
+_saved: list[dict[str, str]] = []
+
+
+async def _spy_save_raw_failure(text, *, model_tag="", error="", slot=""):
+    _saved.append({"text": text, "error": error, "slot": slot})
+    return True
+
+
+_real_save_raw_failure = store_mod.save_raw_failure
+store_mod.save_raw_failure = _spy_save_raw_failure  # type: ignore[assignment]
+
+# slots 写成字符串（模型偶尔会这样跑偏）：from_dict 抠不出 slots
+_bad_payload = _json.dumps(
+    {"name": "休息日型", "mood": "基调", "tags": ["休息"], "slots": "一会儿再说"},
+    ensure_ascii=False,
+)
+
+
+async def _fake_bad_llm_call(config, system, user, **kwargs):
+    return LLMCallResult(ok=True, text=_bad_payload, model_tag="fake-model")
+
+
+pool_mod.llm.call = _fake_bad_llm_call  # type: ignore[assignment]
+
+_blank_archetype, _blank_tag, _blank_problems, _blank_lines = run(
+    pool_mod.build_archetype(
+        _real_pool_config,
+        fake_snapshot,
+        _real_pool_profile,
+        SourceBundle(persona_block="测试人设", used=["persona"]),
+        kind=ARCHETYPE_WEEKEND,
+        existing=[],
+        now=MONDAY,
+    )
+)
+
+check(
+    "slots 不是数组 → 判为结构不完整",
+    _blank_archetype is None
+    and _blank_problems == ["结构不完整（缺少 slots 或变体）"],
+    str(_blank_problems),
+)
+check(
+    "结构不完整时留下了现场（旧代码这里直接 return，日志里只剩一句话）",
+    len(_saved) == 1 and _saved[0]["slot"] == "pool",
+    str(_saved),
+)
+check(
+    "留档原因里带上顶层键名与 slots 类型（省得下次还要靠猜）",
+    bool(_saved)
+    and "payload 顶层键=" in _saved[0]["error"]
+    and "slots 类型=str" in _saved[0]["error"],
+    _saved[0]["error"] if _saved else "（没有留档）",
+)
+
+store_mod.save_raw_failure = _real_save_raw_failure  # type: ignore[assignment]
+
+# ── 5d. 输出被截断时也要把日型救回来（旧代码只认 entries，救不回来）──────────
+section("5d. 日型被 max_tokens 截断时的补救")
+
+from daily_schedule import llm as llm_mod  # noqa: E402
+
+# 形状照抄真机日志：slots 写到最后一个的中间就断了，yield_lines 还没轮到输出。
+# 旧代码里 _recover_truncated 写死 parsed.get("entries")，日型永远配不平，于是
+# extract_json 退化成 _iter_balanced_objects 找到的内部 slot 片段 →
+# from_dict 抠不到 slots → 报「结构不完整（缺少 slots 或变体）」。
+_truncated_archetype = (
+    '{"name": "宅家慢活日", "mood": "睡到自然醒。", "tags": ["宅家", "下厨"], "slots": ['
+    '{"start": "00:00", "end": "07:00", "variants": ['
+    '{"doing": "睡得摊成一片，一只手还搭在床沿外头。", "busy": 0, "hint": ""}]},'
+    '{"start": "07:00", "end": "09:00", "variants": ['
+    '{"doing": "醒了却不起，躺着看天花板上那道裂纹发呆。", "busy": 0, "hint": ""}]},'
+    ' {"doing": "抱着电脑点开论文又合上，最后'
+)
+
+_recovered_payload = llm_mod.extract_json(_truncated_archetype)
+_recovered_archetype = Archetype.from_dict(
+    {**(_recovered_payload or {}), "kind": ARCHETYPE_WEEKEND}
+)
+
+check(
+    "截断在最后一个 slot 中间 → 救回的是日型对象，不是内部 slot 片段",
+    isinstance(_recovered_payload, dict) and "slots" in _recovered_payload,
+    str(sorted((_recovered_payload or {}).keys())),
+)
+check(
+    "救回的 slots 保留了截断前的完整段",
+    isinstance(_recovered_payload, dict)
+    and len(_recovered_payload.get("slots") or []) == 2,
+    str(len((_recovered_payload or {}).get("slots") or [])),
+)
+check(
+    "救回的日型能被 from_dict 接住（不再报「结构不完整」）",
+    _recovered_archetype is not None,
+)
+check(
+    "但仍被覆盖校验拦下，反馈是「必须到 23:59」这种能指导重试的话",
+    _recovered_archetype is not None
+    and any(
+        "23:59" in item
+        for item in validate_archetype(
+            _recovered_archetype, min_entries=6, max_entries=14, want_variants=3
+        )
+    ),
+    str(
+        validate_archetype(
+            _recovered_archetype, min_entries=6, max_entries=14, want_variants=3
+        )
+        if _recovered_archetype is not None
+        else []
+    ),
+)
+
 # ── 6. 三层规划：周期边界 / 校验 / 型池填充 / 随机评估 / 链条 ──────────────────
 section("6. 三层规划：年程 → 月程 → 周程")
 

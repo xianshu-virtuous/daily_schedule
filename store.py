@@ -178,7 +178,9 @@ async def load_log(date_str: str) -> dict[str, Any] | None:
     return await _load_raw(log_key(date_str))
 
 
-async def save_raw_failure(text: str, *, model_tag: str = "", error: str = "") -> bool:
+async def save_raw_failure(
+    text: str, *, model_tag: str = "", error: str = "", slot: str = ""
+) -> bool:
     """把一次解析失败的模型原始返回留档，方便事后排查。
 
     只保留最近一次：解析失败本来就不常见，留档是为了能直接看到模型到底
@@ -188,6 +190,10 @@ async def save_raw_failure(text: str, *, model_tag: str = "", error: str = "") -
         text: 模型原始返回。
         model_tag: 实际使用的模型标识。
         error: 失败原因摘要。
+        slot: 失败来源（``pool`` / ``plan`` / ``generate``）。给了就**额外**写一份
+            ``raw-failure-<slot>.json``：``raw-failure-last`` 会被后发生的失败覆盖，
+            而刷池一轮要重试好几次、又和规划生成交错跑，原来的现场很容易被别的
+            阶段挤掉——分来源留档才查得动。
 
     Returns:
         是否写入成功。
@@ -198,7 +204,10 @@ async def save_raw_failure(text: str, *, model_tag: str = "", error: str = "") -
         "error": error,
         "text": str(text or "")[:20000],
     }
-    return await _save_raw(RAW_FAILURE_KEY, payload)
+    ok = await _save_raw(RAW_FAILURE_KEY, payload)
+    if slot:
+        await _save_raw(f"{RAW_FAILURE_KEY}-{slot}", payload)
+    return ok
 
 
 async def load_raw_failure() -> dict[str, Any] | None:
