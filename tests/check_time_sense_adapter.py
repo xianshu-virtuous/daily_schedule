@@ -301,6 +301,113 @@ async def main() -> int:
         "无服务时按 False 处理",
     )
 
+    # ── 5. 加载期注册表竞态（v1.2.6） ────────────────────────────────────────
+    #
+    # 框架按插件名字母序加载：time_sense(t) 排在 daily_schedule(d) 之后。
+    # 旧版在加载钩子里直接 get_service() 探测 → 框架刷
+    # 「Service 类未找到: time_sense:service:time_sense」，还把主人开了的
+    # 离线生活误判成「没装 time_sense」而静默关闭。
+    section("5. 加载期注册表预检：不刷 warning，也不误判")
+
+    original_all = service_mod.service_api.get_all_services
+    probe_calls: list[str] = []
+
+    def _record_get_service(signature: str):
+        probe_calls.append(signature)
+        return None
+
+    # 5.1 注册表明确没有 time_sense → 一次 get_service 都不该发
+    service_mod.service_api.get_all_services = lambda: {  # type: ignore[assignment]
+        "daily_schedule:service:schedule": object
+    }
+    service_mod.service_api.get_service = _record_get_service  # type: ignore[assignment]
+    check(
+        "5.1 未注册时不调 get_service（WARNING 的根源）",
+        svc._sense() is None and probe_calls == [],
+        f"probe_calls={probe_calls}",
+    )
+    check("5.1 time_sense_available() 安静降级", svc.time_sense_available() is False)
+    check(
+        "5.1 time_sense_registered() 明确回答「没注册」",
+        service_mod.time_sense_registered() is False,
+    )
+
+    # 5.2 注册表里有它 → 照常取服务（不当成降级）
+    service_mod.service_api.get_all_services = lambda: {  # type: ignore[assignment]
+        service_mod.TIME_SENSE_SIGNATURE: object
+    }
+    service_mod.service_api.get_service = lambda signature: _V2Sense()  # type: ignore[assignment]
+    check(
+        "5.2 已注册时正常取到服务",
+        service_mod.time_sense_registered() is True
+        and svc.time_sense_available() is True,
+    )
+
+    # 5.3 拿不到注册表 / 表还空着 → 不武断判缺席（退回老行为）
+    def _boom_all():
+        raise RuntimeError("registry down")
+
+    service_mod.service_api.get_all_services = _boom_all  # type: ignore[assignment]
+    check(
+        "5.3 注册表不可读：不武断判缺席",
+        service_mod.time_sense_registered() is None,
+    )
+    service_mod.service_api.get_all_services = lambda: {}  # type: ignore[assignment]
+    check(
+        "5.4 空注册表（极早期）：不武断判缺席",
+        service_mod.time_sense_registered() is None,
+    )
+
+    service_mod.service_api.get_all_services = original_all  # type: ignore[assignment]
+    service_mod.service_api.get_service = original  # type: ignore[assignment]
+
+    # 5.5 plugin 层：等 time_sense 出现（出现即返回，不在加载期误判）
+    from daily_schedule import plugin as plugin_mod
+
+    plugin_obj = plugin_mod.DailySchedulePlugin(DailyScheduleConfig())
+    original_wait = plugin_mod.time_sense_registered
+    polls = {"n": 0}
+
+    def _late_registration():
+        polls["n"] += 1
+        return True if polls["n"] >= 3 else False
+
+    plugin_mod.time_sense_registered = _late_registration  # type: ignore[assignment]
+    waited = await plugin_obj._wait_time_sense()
+    check(
+        "5.5 等服务出现：出现即返回",
+        waited is True and polls["n"] >= 3,
+        f"轮询 {polls['n']} 次",
+    )
+
+    plugin_mod.time_sense_registered = lambda: None  # type: ignore[assignment]
+    check(
+        "5.6 注册表不可读：不干等，直接按不在位处理",
+        await plugin_obj._wait_time_sense() is False,
+    )
+    plugin_mod.time_sense_registered = original_wait  # type: ignore[assignment]
+
+    # 5.7 离线生活自动开启：不在位保持关，在位自动开
+    late_config = DailyScheduleConfig()
+    late_config.offline.enabled = False
+    late_config.offline.auto_enable_with_time_sense = True
+    late_plugin = plugin_mod.DailySchedulePlugin(late_config)
+
+    service_mod.service_api.get_all_services = lambda: {}  # type: ignore[assignment]
+    service_mod.service_api.get_service = lambda signature: None  # type: ignore[assignment]
+    late_plugin._autodetect_offline()
+    check("5.7 不在位：离线生活保持关闭", late_config.offline.enabled is False)
+
+    service_mod.service_api.get_all_services = lambda: {  # type: ignore[assignment]
+        service_mod.TIME_SENSE_SIGNATURE: object
+    }
+    service_mod.service_api.get_service = lambda signature: _V2Sense()  # type: ignore[assignment]
+    late_plugin._autodetect_offline()
+    check("5.8 在位：自动开启离线生活", late_config.offline.enabled is True)
+
+    service_mod.service_api.get_all_services = original_all  # type: ignore[assignment]
+    service_mod.service_api.get_service = original  # type: ignore[assignment]
+
     print("-" * 72)
     if _failures:
         print(f"结果：{len(_failures)} 项失败 -> {_failures}")

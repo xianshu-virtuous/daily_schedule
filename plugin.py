@@ -35,7 +35,7 @@ from src.kernel.scheduler import TriggerType, get_unified_scheduler
 from .commands import GoalCommand, ScheduleCommand
 from .config import DailyScheduleConfig
 from .handlers import OwnerPresenceHandler, SceneInjectorHandler
-from .service import TIME_SENSE_SIGNATURE, ScheduleService
+from .service import TIME_SENSE_SIGNATURE, ScheduleService, time_sense_registered
 
 logger = get_logger("daily_schedule")
 
@@ -47,6 +47,13 @@ _MIN_INTERVAL_SECONDS = 30
 
 #: 启动报告等日程服务的重试次数（每次 0.5s）。
 _STARTUP_RETRY_TIMES = 60
+
+#: 等 time_sense 注册进组件注册表的最长秒数（每次 0.5s 轮询一次）。
+#:
+#: 框架按插件名字母序加载，``time_sense``(t) 排在 ``daily_schedule``(d) 之后，
+#: 实测差 1~3 秒（Aemeath 2026-10-13 22:40 那次是 2 秒）。给 30 秒足够宽裕，
+#: 真没装时也不会把启动拖出可感知的延迟——这段时间本来就在等调度器与启动画面。
+_TIME_SENSE_WAIT_SECONDS = 30
 
 #: 等「启动画面收尾」的最长时间（秒）。
 #:
@@ -103,7 +110,7 @@ class DailySchedulePlugin(BasePlugin):
         "让 Bot 拥有自己的时间：三层规划（年程→月程→周程）定方向、日程池每日轮换抽取、"
         "主人来时只在触发会话让位；判定只落在日程层，完成度按下级 50% 上卷"
     )
-    plugin_version: str = "1.2.1"
+    plugin_version: str = "1.2.6"
     configs: list[type] = [DailyScheduleConfig]
 
     def __init__(self, config: Any = None) -> None:
@@ -115,7 +122,7 @@ class DailySchedulePlugin(BasePlugin):
         super().__init__(config)
         self._schedule_ids: list[str] = []
         self._register_task_id: str | None = None
-        self._report_task_id: str | None = None
+        self._startup_task_id: str | None = None
         self._settle_task_id: str | None = None
 
     def get_components(self) -> list[type]:
@@ -139,33 +146,23 @@ class DailySchedulePlugin(BasePlugin):
     # ── 生命周期 ──────────────────────────────────────────────────────────────
 
     async def on_plugin_loaded(self) -> None:
-        """加载后：等调度器就绪注册巡检任务，并把当前日程打到日志里。"""
+        """加载后：排队启动例程（等 time_sense → 定离线生活 → 报日程），并注册巡检。
+
+        启动例程是**异步排队**的，不在加载钩子里同步做判断：框架按插件名字母序
+        加载，``time_sense`` 排在 ``daily_schedule`` 后面，加载期任何探测都必然扑空。
+        """
         if isinstance(self.config, DailyScheduleConfig) and not self.config.plugin.enabled:
             return
 
         try:
             task_info = get_task_manager().create_task(
-                self._startup_report(),
-                name="daily_schedule_startup_report",
+                self._startup_routine(),
+                name="daily_schedule_startup",
                 daemon=True,
             )
-            self._report_task_id = task_info.task_id
-        except Exception as error:  # noqa: BLE001 - 报告失败只影响日志
-            logger.warning(f"[daily_schedule] 排队启动日程报告失败: {error}")
-
-        if isinstance(self.config, DailyScheduleConfig):
-            self._autodetect_offline()
-
-        if isinstance(self.config, DailyScheduleConfig) and self.config.offline.enabled:
-            try:
-                task_info = get_task_manager().create_task(
-                    self._settle_offline_when_ready(),
-                    name="daily_schedule_offline_settlement",
-                    daemon=True,
-                )
-                self._settle_task_id = task_info.task_id
-            except Exception as error:  # noqa: BLE001 - 失败只影响这一篇日记
-                logger.warning(f"[daily_schedule] 排队离线结算失败: {error}")
+            self._startup_task_id = task_info.task_id
+        except Exception as error:  # noqa: BLE001 - 启动例程失败只影响日志与离线日记
+            logger.warning(f"[daily_schedule] 排队启动例程失败: {error}")
 
         if isinstance(self.config, DailyScheduleConfig) and not self.config.schedule.prewarm_time.strip():
             logger.info("[daily_schedule] 未配置 prewarm_time，跳过预生成任务注册")
@@ -181,6 +178,59 @@ class DailySchedulePlugin(BasePlugin):
         except Exception as error:  # noqa: BLE001 - 注册失败只影响预生成
             logger.warning(f"[daily_schedule] 排队注册预生成任务失败: {error}")
 
+    async def _startup_routine(self) -> None:
+        """启动例程：等 time_sense → 定离线生活 → 排队离线结算 → 打日程报告。
+
+        顺序是有意的：离线生活的开关决定要不要排队结算，而报告要读 time_sense
+        的能力清单——两者都得等它注册之后才算得准（见 ``_wait_time_sense``）。
+        """
+        await self._wait_time_sense()
+
+        if isinstance(self.config, DailyScheduleConfig):
+            self._autodetect_offline()
+
+        if isinstance(self.config, DailyScheduleConfig) and self.config.offline.enabled:
+            try:
+                task_info = get_task_manager().create_task(
+                    self._settle_offline_when_ready(),
+                    name="daily_schedule_offline_settlement",
+                    daemon=True,
+                )
+                self._settle_task_id = task_info.task_id
+            except Exception as error:  # noqa: BLE001 - 失败只影响这一篇日记
+                logger.warning(f"[daily_schedule] 排队离线结算失败: {error}")
+
+        await self._startup_report()
+
+    async def _wait_time_sense(self) -> bool:
+        """等 time_sense 的服务注册进组件注册表。
+
+        框架按插件名做拓扑排序，同层按字母序加载：``time_sense``(t) 排在
+        ``daily_schedule``(d) 之后，所以**加载期**去取它的服务必然扑空——
+        框架会刷 ``Service 类未找到: time_sense:service:time_sense`` 的 WARNING，
+        而「装了 time_sense 却被判成没装」（离线生活被静默关掉）也是这么来的。
+
+        这里用只读的 :func:`service.time_sense_registered` 轮询：只查注册表，
+        不调 ``get_service()``，因此一条 warning 都不会产生。
+
+        Returns:
+            等到了返回 True；超时或无法判断返回 False（调用方按「不在位」处理）。
+        """
+        for _ in range(_TIME_SENSE_WAIT_SECONDS * 2):
+            state = time_sense_registered()
+            if state is True:
+                return True
+            if state is None:
+                # 拿不到注册表就无从等待：退回老行为，让探测自己决定。
+                logger.debug("[daily_schedule] 组件注册表不可读，不等待 time_sense")
+                return False
+            await asyncio.sleep(0.5)
+
+        logger.debug(
+            f"[daily_schedule] 等 {_TIME_SENSE_WAIT_SECONDS}s 仍未见 time_sense 注册"
+        )
+        return False
+
     def _autodetect_offline(self) -> None:
         """检测机制：装了 time_sense 就自动打开离线生活。
 
@@ -194,6 +244,10 @@ class DailySchedulePlugin(BasePlugin):
         2. ``offline.auto_enable_with_time_sense`` 是 ``false`` → 不自动开
            （要让离线生活**始终关闭**，把这两项都设 false）；
         3. time_sense 不在位 → 不自动开（没有时间事实可缝，开了也只剩系统时间）。
+
+        调用点在 ``_startup_routine`` 里，**已经等过** time_sense 注册（见
+        ``_wait_time_sense``）：加载期直接判定会误判成「没装」，
+        把主人明明开了的离线日记静默关掉。
 
         只改**运行时**的配置对象，不回写 ``config.toml``：这是本进程的行为决策，
         不该偷偷改用户的配置文件。代价是「自动开」这件事在配置里看不出来，
@@ -221,7 +275,7 @@ class DailySchedulePlugin(BasePlugin):
         if sense is None or not callable(getattr(sense, "now_snapshot", None)):
             logger.info(
                 "[daily_schedule] 未检测到 time_sense，离线生活保持关闭"
-                "（装上它之后会自动开启）"
+                "（装上它、下次启动会自动开启）"
             )
             return
 
@@ -267,12 +321,12 @@ class DailySchedulePlugin(BasePlugin):
                 pass
             self._register_task_id = None
 
-        if self._report_task_id:
+        if self._startup_task_id:
             try:
-                get_task_manager().cancel_task(self._report_task_id)
+                get_task_manager().cancel_task(self._startup_task_id)
             except Exception:  # noqa: BLE001 - 任务可能已结束
                 pass
-            self._report_task_id = None
+            self._startup_task_id = None
 
         if self._settle_task_id:
             try:

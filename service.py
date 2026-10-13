@@ -84,6 +84,31 @@ _TIME_SENSE_SIGNATURE = "time_sense:service:time_sense"
 #: 同一签名的公开别名——别的模块（比如 plugin 里的自动检测）不必再抄一遍字符串。
 TIME_SENSE_SIGNATURE = _TIME_SENSE_SIGNATURE
 
+
+def time_sense_registered() -> bool | None:
+    """time_sense 的服务组件此刻是否已经注册进全局注册表。
+
+    框架按插件名做拓扑排序，同层按**字母序**加载：``time_sense``(t) 排在
+    ``daily_schedule``(d)、``context_archiver``(c) 之后。于是**加载期**直接
+    ``get_service()`` 必然扑空——框架会为此打一条 ``Service 类未找到`` 的
+    WARNING（日志噪声），更糟的是「装了 time_sense 却判成没装」这类误判。
+
+    这里先用只读的 ``get_all_services()`` 预检一次：明确没注册就安静短路，
+    一条 warning 都不惊动。要等它出现请用 ``plugin._wait_time_sense()``。
+
+    Returns:
+        ``True`` 已注册；``False`` 明确没注册；``None`` 判断不了
+        （拿不到注册表，或表还是空的——此时不武断，按老行为直接取服务）。
+    """
+    try:
+        registered = service_api.get_all_services()
+    except Exception as error:  # noqa: BLE001 - 拿不到注册表就退回直接取服务
+        logger.debug(f"[daily_schedule] 读取组件注册表失败: {error}")
+        return None
+    if not isinstance(registered, dict) or not registered:
+        return None
+    return _TIME_SENSE_SIGNATURE in registered
+
 #: 本进程的时间基准（本模块被导入的时刻）。用来判断 time_sense 报出的
 #: ``boot_at`` 是不是「本次进程启动之后」的，见 ``wait_time_sense_settled``。
 _PROCESS_START_TS = time.time()
@@ -197,11 +222,18 @@ class ScheduleService(BaseService):
     # ── 时间源（time_sense） ─────────────────────────────────────────────────
 
     def _sense(self) -> Any | None:
-        """取 time_sense 服务。
+        """取 time_sense 服务实例。
+
+        明确没注册时不调用 ``get_service()``：那会让框架打一条
+        ``Service 类未找到`` 的 WARNING（加载期必然发生，见
+        :func:`time_sense_registered`）。
 
         Returns:
             服务实例；未安装、未启用或查询失败时返回 ``None``。
         """
+        if time_sense_registered() is False:
+            return None
+
         try:
             service = service_api.get_service(_TIME_SENSE_SIGNATURE)
         except Exception as error:  # noqa: BLE001 - 服务查询失败按不可用处理
@@ -1864,4 +1896,4 @@ class ScheduleService(BaseService):
         )
 
 
-__all__ = ["SceneTexts", "ScheduleService"]
+__all__ = ["SceneTexts", "ScheduleService", "time_sense_registered"]
